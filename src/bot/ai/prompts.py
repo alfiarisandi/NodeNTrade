@@ -125,6 +125,12 @@ New York sessions and their overlap; avoid entries shortly before high-impact ev
 
 Hard rules:
 - At most 2 setups per symbol. Quality over quantity: "WAIT / NO TRADE" is a good answer; never force a setup.
+- "price_now" (live bid/ask) is the real current price; candles may lag. After the owner confirms, the bot \
+places a LIMIT order at the middle of your entry zone when price has not reached it yet (it waits up to \
+valid_minutes, cancelled if unfilled), or a market order when price is already in/through the zone. So put the \
+zone at the best structural level (resistance/supply for SELL, support/demand for BUY), even if price must \
+first pull back to it, but keep it within ~1.5 ATR H1 of price_now and set valid_minutes to a realistic wait. \
+Never place a SELL zone below price_now or a BUY zone above it unless it is a deliberate breakout retest.
 - Every setup has an entry zone, a stop loss beyond a structural level, TP1 with reward:risk >= 2 measured \
 from the middle of the zone, and TP2 further away. Setups that cannot reach RR 2 are not setups.
 - Confidence: "High" = all main confirmations present; "Medium" = some present, still needs the stated \

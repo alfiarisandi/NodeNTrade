@@ -61,11 +61,11 @@ def test_analysis_context_structure(uptrend_waves, settings, eurusd_meta):
     ctx = json.loads(build_analysis_context(
         {"EURUSD": {"H4": h4, "H1": h1, "M15": h1.tail(300), "M5": h1.tail(60)}}, settings.strategy,
         {"EURUSD": eurusd_meta}, {"EURUSD": 12.0}, datetime(2026, 1, 14, 9, 0, tzinfo=timezone.utc), 2,
-        rules={"min_reward_risk": 2}))
+        rules={"min_reward_risk": 2}, prices={"EURUSD": {"bid": 1.123456, "ask": 1.1236}}))
     sym = ctx["symbols"]["EURUSD"]
     assert set(sym["market"]) == {"H4", "H1", "M15"} and sym["spread_points"] == 12.0
     assert set(sym["structure"]) == {"H1", "M15"} and len(sym["last_30_M15_candles[time,o,h,l,c]"]) == 30
     assert len(sym["last_20_M5_candles[time,o,h,l,c]"]) == 20 and "prev_day_high" not in sym["key_levels"]
     assert ctx["session"]["label"] == "London" and ctx["high_impact_events_next_24h"] == "calendar unavailable"
-    assert ctx["owner_rules"] == {"min_reward_risk": 2}
+    assert ctx["owner_rules"] == {"min_reward_risk": 2} and sym["price_now"] == {"bid": 1.12346, "ask": 1.1236}
     assert resample_h4

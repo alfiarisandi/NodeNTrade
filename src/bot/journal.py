@@ -82,7 +82,9 @@ class Journal:
         for col, typ in [("ref_price", "REAL"), ("user_decision", "TEXT"), ("user_risk", "REAL"),
                          ("confirm_msg_id", "INTEGER"), ("confirm_expires", "TEXT"),
                          ("source", "TEXT DEFAULT 'rule'"),   # rule = sinyal strategi | ai_setup = setup 📊 Analisis
-                         ("setup", "TEXT")]:                  # JSON setup Claude (zona, TP1/TP2, timeframe, alasan)
+                         ("setup", "TEXT"),                   # JSON setup Claude (zona, TP1/TP2, timeframe, alasan)
+                         ("limit_ticket", "INTEGER"),         # order limit pending di MT5 (user_decision = 'limit')
+                         ("limit_expires", "TEXT")]:
             if col not in have:
                 self.db.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
 
@@ -91,6 +93,9 @@ class Journal:
 
     def pending_confirmations(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM signals WHERE user_decision='pending'").fetchall()
+
+    def limit_orders(self) -> list[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM signals WHERE user_decision='limit'").fetchall()
 
     # ---------- sinyal ----------
     def signal_exists(self, symbol: str, bar_time: str) -> bool:
@@ -109,8 +114,9 @@ class Journal:
         return cur.lastrowid
 
     def setups_executed_since(self, iso_ts: str) -> int:
-        """Jumlah setup 📊 Analisis yang benar-benar dieksekusi sejak iso_ts (kuota harian)."""
-        return self.db.execute("SELECT COUNT(*) FROM signals WHERE source='ai_setup' AND executed=1 AND created_at >= ?",
+        """Jumlah setup 📊 Analisis yang dieksekusi (atau limit-nya masih menunggu) sejak iso_ts (kuota harian)."""
+        return self.db.execute("SELECT COUNT(*) FROM signals WHERE source='ai_setup' AND created_at >= ?"
+                               " AND (executed=1 OR user_decision='limit')",
                                (iso_ts,)).fetchone()[0]
 
     def update_signal(self, signal_id: int, **fields) -> None:

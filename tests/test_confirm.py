@@ -115,16 +115,56 @@ def test_setup_offered_and_executed_at_setup_levels(tmp_path, csettings, at_sign
     assert "pilihan Anda" in msgs[-1]
 
 
-def test_setup_blocked_when_price_leaves_zone(tmp_path, csettings, at_signal, eurusd_meta):
+def test_setup_blocked_when_price_passed_sl(tmp_path, csettings, at_signal, eurusd_meta):
     from types import SimpleNamespace
     bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
-    offer(bot, mt5)
-    far = mt5.tick("EURUSD").ask + 0.0030
+    offer(bot, mt5)   # BUY, SL = harga - 0.0040
+    far = mt5.tick("EURUSD").ask - 0.0050   # harga sudah di bawah SL
     mt5.tick = lambda symbol: SimpleNamespace(bid=far - 0.0001, ask=far)
     click(bot, f"c:{signal_row(bot)['id']}:0.005")
     row = signal_row(bot)
-    assert mt5.orders == [] and row["user_decision"] == "blocked" and row["shadow_status"] == "open"
-    assert "di luar zona entry" in msgs[-1]
+    assert mt5.orders == [] and mt5.limits == [] and row["user_decision"] == "blocked" and row["shadow_status"] == "open"
+    assert "melewati SL/TP" in msgs[-1]
+    bot.resolve_shadows()   # bar_time setup berupa label teks: tidak boleh crash
+
+
+def test_setup_limit_when_zone_not_reached_then_fill_and_expiry(tmp_path, csettings, at_signal, eurusd_meta):
+    from types import SimpleNamespace
+    bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
+    base = mt5.tick("EURUSD").ask
+    offer(bot, mt5)   # BUY zona base +- 0.0005
+    far = base + 0.0030   # harga di atas zona BUY: tunggu pullback
+    mt5.tick = lambda symbol: SimpleNamespace(bid=far - 0.0001, ask=far)
+    click(bot, f"c:{signal_row(bot)['id']}:0.005")
+    row = signal_row(bot)
+    assert mt5.orders == [] and len(mt5.limits) == 1 and row["user_decision"] == "limit"
+    _, d, vol, price, sl, tp = mt5.limits[0]
+    assert d == 1 and price == pytest.approx(base) and sl == pytest.approx(base - 0.0040) and tp == pytest.approx(base + 0.0100)
+    assert "LIMIT BUY" in msgs[-1] and bot.setups_today() == 1
+    assert bot.open_list() == [("EURUSD", 1)]   # limit menunggu ikut dihitung untuk batas posisi/eksposur
+    # terisi: tercatat sebagai trade
+    ticket = row["limit_ticket"]
+    mt5.pending.clear()
+    mt5.outcomes[ticket] = {"filled": True, "position_id": 555, "price": base, "volume": vol, "sl": sl, "tp": tp}
+    now = datetime.now(timezone.utc)
+    bot.manage_limit_orders(now, 10_000.0)
+    assert signal_row(bot)["executed"] == 1 and bot.journal.open_trades()[0]["ticket"] == 555
+    assert "LIMIT TERISI" in msgs[-1]
+    # limit lain yang kedaluwarsa dibatalkan
+    bot.journal.update_signal(row["id"], user_decision="limit", limit_expires=(now - timedelta(minutes=1)).isoformat())
+    mt5.pending.append(SimpleNamespace(ticket=ticket, magic=bot.s.magic))
+    bot.manage_limit_orders(now, 10_000.0)
+    assert mt5.pending == [] and signal_row(bot)["user_decision"] == "limit_cancelled" and "kedaluwarsa" in msgs[-1]
+
+
+def test_setup_outside_zone_executes_when_rr_ok(tmp_path, csettings, at_signal, eurusd_meta):
+    from types import SimpleNamespace
+    bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
+    offer(bot, mt5)
+    near = mt5.tick("EURUSD").ask - 0.0010   # BUY di bawah zona: harga lebih baik, RR naik (market)
+    mt5.tick = lambda symbol: SimpleNamespace(bid=near - 0.0001, ask=near)
+    click(bot, f"c:{signal_row(bot)['id']}:0.005")
+    assert len(mt5.orders) == 1 and "pilihan Anda" in msgs[-1]
 
 
 def test_setup_quota_and_low_confidence_not_offered(tmp_path, csettings, at_signal, eurusd_meta):

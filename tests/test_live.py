@@ -15,6 +15,7 @@ class FakeMT5:
         self.h1, self.h4, self.meta = h1, h4, meta
         self.open_positions, self.orders, self.closed_positions = [], [], []
         self.closed = {}
+        self.limits, self.pending, self.outcomes = [], [], {}
 
     def account(self):
         return SimpleNamespace(login=1, server="Demo", equity=10_000.0, balance=10_000.0, currency="USD")
@@ -40,6 +41,21 @@ class FakeMT5:
                               price_open=self.tick(symbol).ask, sl=0.0, tp=0.0, profit=0.0)
         self.open_positions.append(pos)
         return SimpleNamespace(price=pos.price_open, order=777)
+
+    def limit_order(self, symbol, direction, volume, price, sl, tp, magic, comment):
+        self.limits.append((symbol, direction, volume, price, sl, tp))
+        self.pending.append(SimpleNamespace(ticket=900 + len(self.limits), magic=magic))
+        return SimpleNamespace(order=900 + len(self.limits))
+
+    def pending_orders(self, magic):
+        return list(self.pending)
+
+    def cancel_order(self, ticket):
+        self.pending = [o for o in self.pending if o.ticket != ticket]
+        return True
+
+    def order_outcome(self, ticket):
+        return self.outcomes.get(ticket)
 
     def close_position(self, pos, comment=""):
         self.closed_positions.append(pos.ticket)

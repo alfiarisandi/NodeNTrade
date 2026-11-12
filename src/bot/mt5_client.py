@@ -179,6 +179,50 @@ class MT5Client:
         detail = f"{last.retcode} {last.comment}" if last is not None else str(self.mt5.last_error())
         raise MT5Error(f"Order {symbol} gagal: {detail}")
 
+    def limit_order(self, symbol: str, direction: int, volume: float, price: float, sl: float, tp: float,
+                    magic: int, comment: str):
+        """Pending BUY/SELL LIMIT (SL & TP harga absolut, tanpa kedaluwarsa: bot yang membatalkan). Raise MT5Error jika gagal."""
+        meta = self.symbol_meta(symbol)
+        t = self.tick(symbol)
+        if abs(price - (t.ask if direction == 1 else t.bid)) <= meta["stops_level"] * meta["point"]:
+            raise MT5Error(f"Harga limit terlalu dekat dengan harga pasar (stops level {meta['stops_level']})")
+        res = self.mt5.order_send({
+            "action": self.mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": float(volume),
+            "type": self.mt5.ORDER_TYPE_BUY_LIMIT if direction == 1 else self.mt5.ORDER_TYPE_SELL_LIMIT,
+            "price": round(price, meta["digits"]),
+            "sl": round(sl, meta["digits"]),
+            "tp": round(tp, meta["digits"]) if tp else 0.0,
+            "magic": magic,
+            "comment": comment[:31],
+            "type_time": self.mt5.ORDER_TIME_GTC,
+            "type_filling": self.mt5.ORDER_FILLING_RETURN,
+        })
+        if res is None or res.retcode != self.mt5.TRADE_RETCODE_DONE:
+            detail = f"{res.retcode} {res.comment}" if res is not None else str(self.mt5.last_error())
+            raise MT5Error(f"Order limit {symbol} gagal: {detail}")
+        return res
+
+    def pending_orders(self, magic: int) -> list:
+        return [o for o in (self.mt5.orders_get() or ()) if o.magic == magic]
+
+    def cancel_order(self, ticket: int) -> bool:
+        res = self.mt5.order_send({"action": self.mt5.TRADE_ACTION_REMOVE, "order": ticket})
+        return res is not None and res.retcode == self.mt5.TRADE_RETCODE_DONE
+
+    def order_outcome(self, ticket: int) -> dict | None:
+        """Nasib order yang sudah tidak pending: terisi (id posisi, harga, lot, SL, TP) atau batal. None = belum ada di histori."""
+        orders = self.mt5.history_orders_get(ticket=ticket)
+        if not orders:
+            return None
+        o = orders[0]
+        if o.state != self.mt5.ORDER_STATE_FILLED:
+            return {"filled": False}
+        deals = [d for d in (self.mt5.history_deals_get(position=o.position_id) or ()) if d.entry == self.mt5.DEAL_ENTRY_IN]
+        return {"filled": True, "position_id": o.position_id, "price": deals[0].price if deals else o.price_open,
+                "volume": o.volume_initial, "sl": o.sl, "tp": o.tp}
+
     def close_position(self, position, comment: str = "bot exit") -> bool:
         """Tutup posisi dengan order market berlawanan."""
         is_buy = position.type == self.mt5.POSITION_TYPE_BUY

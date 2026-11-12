@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from bot.ai.analysis import Analysis, analyze_market, format_setup, validate_setup
+from bot.ai.analysis import MIN_RR, Analysis, analyze_market, format_setup, validate_setup
 from bot.ai.client import LLM
 from bot.ai.context import build_analysis_context, build_review_context, market_summary
 from bot.ai.daily_review import daily_report, weekly_report
@@ -166,6 +166,7 @@ class LiveBot:
             self.calendar.refresh(now)
         self.manage_breakeven()
         self.manage_take_profit_and_hold(now)
+        self.manage_limit_orders(now, acc.equity)
         self.sync_closed_trades()
         self.poll_confirmations()
         self.send_alerts(now)
@@ -478,19 +479,23 @@ class LiveBot:
         moved = abs(price - (row["ref_price"] or price)) / atr if atr else 0.0
         sl_dist, tp_dist, setup_block = row["sl_distance"], row["tp_distance"], None
         setup = json.loads(row["setup"]) if row["source"] == "ai_setup" and row["setup"] else None
+        zone_ahead = False
         if setup:
-            # Setup 📊 Analisis: harga harus di dalam zona entry; SL & TP tetap di level setup, bukan jarak dari fill
+            # Setup 📊 Analisis: SL & TP tetap di level setup, bukan jarak dari fill
             f = f".{meta['digits']}f"
             tol = 0.1 * atr
             sl_dist, tp_dist = d * (price - setup["stop_loss"]), d * (setup["take_profit_1"] - price)
             moved = 0.0
-            if not setup["entry_low"] - tol <= price <= setup["entry_high"] + tol:
-                setup_block = (f"harga {price:{f}} di luar zona entry {setup['entry_low']:{f}}-{setup['entry_high']:{f}}; "
-                               f"tunggu harga masuk zona lalu minta analisis lagi")
-            elif sl_dist <= 0 or tp_dist <= 0:
+            # Zona belum tercapai (SELL: harga di bawah zona, BUY: di atas): pasang order LIMIT di tengah zona.
+            # Di zona / sudah lewat zona ke arah lebih baik: order market, asal RR di harga itu masih cukup.
+            zone_ahead = (price < setup["entry_low"] - tol) if d == -1 else (price > setup["entry_high"] + tol)
+            if sl_dist <= 0 or tp_dist <= 0:
                 setup_block = "harga sudah melewati SL/TP setup"
             elif self.setups_today() >= self.s.confirm.max_setups_per_day:
                 setup_block = f"kuota {self.s.confirm.max_setups_per_day} setup/hari sudah terpakai"
+            elif not zone_ahead and tp_dist / sl_dist < MIN_RR - 1e-9:
+                setup_block = (f"harga {price:{f}} di luar zona entry {setup['entry_low']:{f}}-{setup['entry_high']:{f}}, "
+                               f"RR di harga ini {tp_dist / sl_dist:.1f} < {MIN_RR:g}")
 
         # Kondisi bisa berubah selama menunggu jawaban: cek ulang semuanya
         streak = self.tilt_streak()
@@ -501,6 +506,9 @@ class LiveBot:
                      if moved > self.s.confirm.max_price_move_atr else None))
         if block:
             self.finish_confirmation(row, "blocked", f"⏭️ Tidak dieksekusi: {block}")
+            return
+        if setup and zone_ahead:
+            self.place_limit(row, setup, risk, acc)
             return
         try:
             lot, fill = self.open_trade(row["id"], sym, d, sl_dist, tp_dist, acc.equity, risk,
@@ -514,6 +522,64 @@ class LiveBot:
         self.notify(f"✅ OPEN {'BUY' if d == 1 else 'SELL'} {sym} @ {fill:.{meta['digits']}f} (pilihan Anda)\n"
                     f"Lot {lot} | SL {fill - d * row['sl_distance']:.{meta['digits']}f} | TP {tp}\n"
                     f"Risiko {acc.equity * risk:.2f} {acc.currency} ({risk * 100:g}%)")
+
+    def place_limit(self, row, setup: dict, risk: float, acc) -> None:
+        """Setup 📊 Analisis, harga belum di zona: pasang LIMIT di tengah zona (SL/TP tetap level setup)."""
+        sym, d = row["symbol"], row["direction"]
+        bsym, digits = self.s.broker_symbol(sym), self.meta[sym]["digits"]
+        price = (setup["entry_low"] + setup["entry_high"]) / 2
+        sl, tp = setup["stop_loss"], setup["take_profit_1"]
+        sl_dist = d * (price - sl)
+        try:
+            lot = self.lot_for(sym, acc.equity, risk, sl_dist)
+            if lot == 0:
+                raise MT5Error(self.min_lot_reason(sym, acc.equity, sl_dist))
+            res = self.mt5.limit_order(bsym, d, lot, price, sl, tp, self.s.magic, "bot user limit")
+        except MT5Error as e:
+            self.finish_confirmation(row, "failed", f"⚠️ Order limit gagal: {e}")
+            return
+        expires = datetime.now(timezone.utc) + timedelta(minutes=setup.get("valid_minutes") or 120)
+        self.journal.update_signal(row["id"], user_decision="limit", user_risk=risk, limit_ticket=res.order,
+                                   limit_expires=expires.isoformat(timespec="seconds"))
+        self.notifier.clear_buttons(row["confirm_msg_id"])
+        f = f".{digits}f"
+        self.notify(f"⏳ LIMIT {'BUY' if d == 1 else 'SELL'} {sym} @ {price:{f}} (tengah zona "
+                    f"{setup['entry_low']:{f}}-{setup['entry_high']:{f}})\nLot {lot} | SL {sl:{f}} | TP {tp:{f}}\n"
+                    f"Risiko {self.risk_amount(sym, lot, sl_dist):.2f} {acc.currency} | batal otomatis "
+                    f"{expires.astimezone(WIB):%H:%M} WIB, atau jika ada berita / batas rugi tercapai")
+
+    def manage_limit_orders(self, now: datetime, equity: float) -> None:
+        """Order limit setup: catat saat terisi, batalkan saat kedaluwarsa / kondisi entry tidak lagi aman."""
+        rows = self.journal.limit_orders()
+        if not rows:
+            return
+        pending = {o.ticket for o in self.mt5.pending_orders(self.s.magic)}
+        for row in rows:
+            sym, d, ticket = row["symbol"], row["direction"], row["limit_ticket"]
+            side = f"{'BUY' if d == 1 else 'SELL'} {sym}"
+            if ticket in pending:
+                why = ("kedaluwarsa" if datetime.fromisoformat(row["limit_expires"]) <= now
+                       else self.news_block(self.s.broker_symbol(sym))
+                       or ("batas rugi harian tercapai" if self.daily.halted(equity) else None)
+                       or ("circuit breaker aktif" if self.dd.halted else None))
+                if why and self.mt5.cancel_order(ticket):
+                    self.journal.update_signal(row["id"], user_decision="limit_cancelled", skip_reason=f"limit: {why}")
+                    self.notify(f"⌛ Limit {side} dibatalkan: {why}")
+                continue
+            out = self.mt5.order_outcome(ticket)
+            if out is None:
+                continue   # histori belum tersedia, coba lagi siklus berikut
+            if not out["filled"]:
+                self.journal.update_signal(row["id"], user_decision="limit_cancelled", skip_reason="limit dibatalkan di MT5")
+                self.notify(f"⌛ Limit {side} tidak terisi (dibatalkan di MT5)")
+                continue
+            sl, tp = out["sl"] or None, out["tp"] or None
+            self.journal.log_trade_open(row["id"], out["position_id"], sym, d, out["volume"], out["price"], sl, tp,
+                                        self.risk_amount(sym, out["volume"], abs(out["price"] - sl)) if sl else 0.0)
+            self.journal.update_signal(row["id"], executed=1, user_decision="approved")
+            f = f".{self.meta[sym]['digits']}f"
+            self.notify(f"✅ LIMIT TERISI {side} @ {out['price']:{f}}\nLot {out['volume']} | "
+                        f"SL {sl:{f}} | TP {tp:{f}}" if sl and tp else f"✅ LIMIT TERISI {side} @ {out['price']:{f}}")
 
     # ---------- perintah Telegram (hanya dari TELEGRAM_CHAT_ID) ----------
     def handle_message(self, msg: dict) -> None:
@@ -615,7 +681,8 @@ class LiveBot:
         for r in rows:
             when = datetime.fromisoformat(r["created_at"]).astimezone(WIB).strftime("%d/%m %H:%M")
             status = ("✅ dieksekusi" if r["executed"] else "⏳ menunggu konfirmasi" if r["user_decision"] == "pending"
-                      else f"⏭️ {r['skip_reason'] or '-'}")
+                      else "⏳ limit menunggu harga" if r["user_decision"] == "limit"
+                  else f"⏭️ {r['skip_reason'] or '-'}")
             ai = f" | AI {r['ai_decision']}" if r["ai_decision"] and r["ai_decision"] != "rule_only" else ""
             src = "📊 setup " if r["source"] == "ai_setup" else ""
             lines.append(f"{when} {src}{'BUY' if r['direction'] == 1 else 'SELL'} {r['symbol']}: {status}{ai}")
@@ -668,12 +735,13 @@ class LiveBot:
         """Kumpulkan snapshot semua pair, minta analisis Claude. Raise jika AI gagal / jawaban tidak valid."""
         now = datetime.now(timezone.utc)
         acc = self.mt5.account()
-        per_symbol, spreads = {}, {}
+        per_symbol, spreads, prices = {}, {}, {}
         for sym, meta in self.meta.items():
             bsym = self.s.broker_symbol(sym)
             per_symbol[sym] = self.analysis_frames(bsym)
             t = self.mt5.tick(bsym)
             spreads[sym] = (t.ask - t.bid) / meta["point"]
+            prices[sym] = {"bid": t.bid, "ask": t.ask}
         positions = [{"symbol": p.symbol, "side": "BUY" if p.type == 0 else "SELL", "volume": p.volume,
                       "open": p.price_open, "sl": p.sl, "tp": p.tp, "profit": round(p.profit, 2)}
                      for p in self.mt5.positions(self.s.magic)]
@@ -684,11 +752,12 @@ class LiveBot:
         rules = {"risk_per_trade_options_%": [o * 100 for o in self.s.confirm.risk_options],
                  "max_daily_loss_%": r.max_daily_loss * 100, "today_pnl_%": round(100 * self.daily.pnl_pct(acc.equity), 2),
                  "max_open_positions": r.max_open_positions, "min_reward_risk": 2,
-                 "execution": "market order by the bot only after the owner confirms and only while price is inside the entry zone"}
+                 "execution": "after owner confirms: price not yet at zone = LIMIT order at zone middle, "
+                              "waits valid_minutes; price at/through zone = market order if RR still >= 2"}
         ctx = build_analysis_context(per_symbol, self.s.strategy, self.meta, spreads, now, self.offset,
                                      self.calendar if self.calendar and self.calendar.available else None,
                                      {"equity": round(acc.equity, 2), "balance": round(acc.balance, 2),
-                                      "currency": acc.currency}, positions, recent, rules)
+                                      "currency": acc.currency}, positions, recent, rules, prices)
         return analyze_market(self.llm, ctx)
 
     def setup_checks(self, analysis: Analysis) -> list[tuple]:
@@ -753,7 +822,7 @@ class LiveBot:
             f" (TP2 {st.take_profit_2:{price_fmt}} dikelola manual)" if st.take_profit_2 is not None else "")
         head = f"SETUP {st.side} {sym} | zona {st.entry_low:{price_fmt}}-{st.entry_high:{price_fmt}}"
         ok = self.ask_confirmation(sid, sym, sig, head, st.stop_loss, tp_txt, price_fmt, acc.equity, suggested, lot,
-                                   text + "\nOrder market dikirim saat Anda klik, hanya jika harga masih di zona.",
+                                   text + "\nKlik: harga belum di zona = pasang order LIMIT di tengah zona; sudah lewat zona = market jika RR >= 2.",
                                    timeout_minutes=min(self.s.confirm.timeout_minutes, st.valid_minutes),
                                    suggest_label="Risiko dasar")
         if not ok:
@@ -872,7 +941,9 @@ class LiveBot:
 
     # ---------- posisi ----------
     def open_list(self) -> list[tuple[str, int]]:
-        return [(p.symbol, 1 if p.type == 0 else -1) for p in self.mt5.positions(self.s.magic)]
+        """Posisi terbuka + order limit setup yang menunggu (dihitung untuk batas posisi & eksposur)."""
+        return ([(p.symbol, 1 if p.type == 0 else -1) for p in self.mt5.positions(self.s.magic)]
+                + [(self.s.broker_symbol(r["symbol"]), r["direction"]) for r in self.journal.limit_orders()])
 
     def find_ticket(self, bsym: str) -> int | None:
         mine = [p for p in self.mt5.positions(self.s.magic) if p.symbol == bsym]
@@ -983,7 +1054,10 @@ class LiveBot:
                 frames = self.frames(self.s.broker_symbol(sym))
                 features[sym] = compute_features(frames[p.entry_tf], frames[p.trend_tf], p, self.offset)
             f = features[sym]
-            bar_time = pd.Timestamp(row["bar_time"])
+            if row["source"] == "ai_setup":   # bar_time setup = label teks, waktu nyata ada di created_at (UTC)
+                bar_time = pd.Timestamp(row["created_at"]).tz_convert(None) + pd.Timedelta(hours=self.offset)
+            else:
+                bar_time = pd.Timestamp(row["bar_time"])
             if f.empty:
                 continue
             if f["time"].iloc[0] > bar_time:

@@ -25,7 +25,7 @@ strategy:
   entry_tf: H4
   trend_tf: D1
   trend_filter: none
-  session_hours: true   # entry hanya di jam session di bawah (jam kerja WIB)
+  session_hours: false # entry 24 jam (akhir pekan & Jumat malam tetap diblok); true = hanya jam session di bawah
   exit_rule: signal     # keluar saat Tenkan memotong balik Kijun
   ema_fast: 20
   ema_slow: 50

@@ -222,7 +222,8 @@ def session_info(now: datetime) -> dict:
 def build_analysis_context(per_symbol: dict[str, dict[str, pd.DataFrame]], p: StrategyCfg, metas: dict[str, dict],
                            spreads: dict[str, float], now: datetime, offset_hours: int = 0, calendar=None,
                            account: dict | None = None, positions: list[dict] | None = None,
-                           recent_trades: list[dict] | None = None, rules: dict | None = None) -> str:
+                           recent_trades: list[dict] | None = None, rules: dict | None = None,
+                           prices: dict[str, dict] | None = None) -> str:
     """Snapshot multi-timeframe semua pair untuk analisis harian Claude (tanpa kandidat sinyal).
     per_symbol = {symbol: {"H4": df, "H1": df, "M15": df, "M5": df}} (frame kosong boleh dihilangkan)."""
     symbols = {}
@@ -231,6 +232,7 @@ def build_analysis_context(per_symbol: dict[str, dict[str, pd.DataFrame]], p: St
         frames = {tf: df for tf, df in frames.items() if df is not None and len(df)}
         intraday = frames.get("M15", frames.get("H1"))
         entry = {
+            "price_now": {k: _r(v, digits) for k, v in (prices or {}).get(sym, {}).items()},
             "spread_points": _r(spreads.get(sym), 1),
             "market": market_summary({tf: frames[tf] for tf in ("H4", "H1", "M15") if tf in frames}, p, digits),
             "key_levels": key_levels(frames, p, digits, offset_hours, now),
