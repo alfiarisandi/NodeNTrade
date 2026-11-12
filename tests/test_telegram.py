@@ -74,10 +74,10 @@ def test_menu_buttons_run_commands(bot):
     assert "#5" in bot.notifier.msgs[-1]
     say(bot, "⏸️ Pause")
     assert bot.journal.get_state("paused") == "1"
-    assert "▶️ Resume" in bot.notifier.menus[-1][2]      # tombol toggle berganti
+    assert "▶️ Resume" in bot.notifier.menus[-1][3]      # tombol toggle berganti
     say(bot, "▶️ Resume")
     assert bot.journal.get_state("paused") == "0"
-    assert "⏸️ Pause" in bot.notifier.menus[-1][2]
+    assert "⏸️ Pause" in bot.notifier.menus[-1][3]
 
 
 class FakeAnalysisLLM:
@@ -219,3 +219,49 @@ def test_two_losses_pause_until_owner_continues(bot, tsettings):
     assert bot.loss_pause()                                             # chat lain tidak bisa melanjutkan
     click(bot, "go:1")
     assert not bot.loss_pause() and "rugi beruntun" not in (bot.entry_block("EURUSD", "EURUSD", 1, 10_000, 1) or "")
+
+
+class FakePositionLLM:
+    def __init__(self, advice):
+        self.reply = json.dumps({"text": "ringkasan", "advice": advice})
+
+    def complete(self, system, user):
+        snap = json.loads(user.split("\n", 1)[1])
+        assert snap["open_positions"][0]["ticket"] == 5 and "EURUSD" in snap["symbols"]
+        return self.reply
+
+
+def test_position_review_buttons_and_guards(bot):
+    price = bot.mt5.tick("EURUSD").bid                      # posisi fixture: BUY 0.1 lot, open 1.0, SL 0.9
+    bot.llm = FakePositionLLM([
+        {"ticket": 5, "action": "MOVE_SL", "new_sl": 1.05, "reason": "di bawah swing"},
+        {"ticket": 5, "action": "MOVE_SL", "new_sl": 0.80, "reason": "melebarkan"},          # ditolak: menjauh
+        {"ticket": 5, "action": "MOVE_SL", "new_sl": price + 0.01, "reason": "lewat harga"},  # ditolak
+        {"ticket": 5, "action": "PARTIAL_CLOSE", "close_frac": 0.5, "reason": "momentum melemah"},
+        {"ticket": 5, "action": "CLOSE", "reason": "struktur patah"},
+        {"ticket": 999, "action": "CLOSE", "reason": "tiket tidak ada"},
+    ])
+    say(bot, "🩺 Posisi AI")
+    datas = [row[0][0][1] for row in bot.notifier.buttons]
+    assert datas == ["pa:5:sl:1.05000", "pa:5:pc:0.05", "pc:5"]
+    assert sum("tidak bisa diterapkan" in m for m in bot.notifier.msgs) == 2
+    click(bot, "pa:5:sl:1.05000")
+    assert bot.mt5.sl_moves == [(5, 1.05)] and "disetujui Anda" in bot.notifier.msgs[-1]
+    click(bot, "pa:5:sl:0.95000")                           # sekarang SL 1.05: 0.95 menjauh -> ditolak saat klik
+    assert bot.mt5.sl_moves == [(5, 1.05)] and "Tidak diterapkan" in bot.notifier.answers[-1]
+    click(bot, "pa:5:pc:0.05")
+    assert bot.mt5.partials == [(5, 0.05)]
+
+
+def test_evaluation_report(bot):
+    say(bot, "📋 Evaluasi")
+    assert "Belum ada trade tertutup" in bot.notifier.msgs[-1]
+    sid = bot.journal.log_signal("EURUSD", 1, "s1", 1.0, 0.01, 0.02, {}, source="ai_setup", setup={"take_profit_1": 1.02})
+    for i, profit in enumerate((20.0, -10.0, 15.0)):
+        bot.journal.log_trade_open(sid, 200 + i, "EURUSD", 1, 0.1, 1.0, 0.99, 1.02, 10.0)
+        bot.journal.close_trade(200 + i, 1.01, f"2026-01-14T1{i}:30:00+00:00", profit)
+    bot.journal.db.execute("UPDATE trades SET open_time='2026-01-14T09:00:00+00:00' WHERE ticket >= 200")
+    say(bot, "/evaluasi")
+    text = bot.notifier.msgs[-1]
+    assert "3 trade tertutup" in text and "Win rate 66.7%" in text and "Profit factor 3.5" in text
+    assert "Expectancy per trade +8.33" in text and "Per sesi: London 3x" in text and "Sampel baru 3 trade" in text

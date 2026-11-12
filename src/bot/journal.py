@@ -167,6 +167,13 @@ class Journal:
         return self.db.execute(
             "SELECT * FROM trades WHERE status='closed' ORDER BY close_time DESC LIMIT ?", (n,)).fetchall()
 
+    def closed_trades(self, source: str | None = None) -> list[sqlite3.Row]:
+        """Trade tertutup (urut waktu tutup) + sumber sinyalnya; source = 'ai_setup' | 'rule' | None (semua)."""
+        rows = self.db.execute(
+            "SELECT t.*, COALESCE(s.source, 'rule') AS source, s.setup AS setup FROM trades t"
+            " LEFT JOIN signals s ON s.id = t.signal_id WHERE t.status='closed' ORDER BY t.close_time").fetchall()
+        return [r for r in rows if source is None or r["source"] == source]
+
     def trades_since(self, iso_ts: str) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT * FROM trades WHERE open_time >= ? OR close_time >= ? ORDER BY id", (iso_ts, iso_ts)).fetchall()

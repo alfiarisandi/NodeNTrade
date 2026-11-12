@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 
 from bot.ai.client import LLM
-from bot.ai.prompts import ANALYSIS_SYSTEM
+from bot.ai.prompts import ANALYSIS_SYSTEM, POSITION_SYSTEM
 
 MIN_RR = 1.5              # minimal reward:risk TP1 (ideal 2+)
 MIN_SCORE = 70            # skor setup di bawah ini = WAIT
@@ -128,3 +128,29 @@ def format_setup(s: Setup, digits: int) -> str:
     if s.invalid_if:
         lines.append(f"Batal jika: {s.invalid_if}")
     return "\n".join(lines)
+
+
+class Advice(BaseModel):
+    ticket: int
+    action: Literal["HOLD", "MOVE_SL", "PARTIAL_CLOSE", "CLOSE"]
+    new_sl: float | None = None
+    close_frac: float | None = None
+    reason: str = ""
+    reverse_scenario: str = ""
+
+
+class PositionReview(BaseModel):
+    text: str = ""
+    advice: list[Advice] = Field(default_factory=list)
+
+
+def review_positions(llm: LLM, context_json: str, system: str = POSITION_SYSTEM) -> PositionReview:
+    """Saran pengelolaan posisi terbuka. Raise LLMError / ValueError jika gagal atau jawaban tidak valid."""
+    raw = llm.complete(system, f"Market snapshot and open positions (JSON):\n{context_json}")
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        raise ValueError("tidak ada JSON di jawaban")
+    try:
+        return PositionReview.model_validate(json.loads(m.group(0)))
+    except (ValidationError, json.JSONDecodeError) as e:
+        raise ValueError(f"jawaban AI tidak valid: {e}") from e
