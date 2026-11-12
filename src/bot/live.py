@@ -8,8 +8,9 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
+from bot.ai.analysis import Analysis, analyze_market, format_setup, validate_setup
 from bot.ai.client import LLM
-from bot.ai.context import build_review_context, market_summary
+from bot.ai.context import build_analysis_context, build_review_context, market_summary
 from bot.ai.daily_review import daily_report, weekly_report
 from bot.ai.prompts import review_system
 from bot.ai.reviewer import ReviewOutcome, review_signal
@@ -34,11 +35,14 @@ COMMANDS = [("status", "Equity, P/L hari ini, drawdown, jam entry berikut"),
             ("sinyal", "5 sinyal terakhir"),
             ("pause", "Hentikan entry baru (posisi tetap dikelola)"),
             ("resume", "Lanjutkan entry baru"),
+            ("analisis", "Analisis pasar XAUUSD & EURUSD oleh Claude"),
             ("menu", "Tampilkan tombol menu"),
             ("help", "Daftar perintah")]
 # Tombol menu permanen di bawah chat: label -> perintah (bot menerima label sebagai teks biasa)
 MENU = {"📟 Status": "status", "📂 Posisi": "posisi", "📈 P/L": "pnl", "🔔 Sinyal": "sinyal",
-        "⏸️ Pause": "pause", "▶️ Resume": "resume", "❓ Bantuan": "help"}
+        "📊 Analisis": "analisis", "⏸️ Pause": "pause", "▶️ Resume": "resume", "❓ Bantuan": "help"}
+ANALYSIS_COOLDOWN = 180       # detik antar analisis: tiap analisis ±15-25 ribu token
+ANALYSIS_FRAMES = {"H4": 300, "H1": 400, "M15": 300, "M5": 120}
 NEWS_ALERT_HOURS = 1.0
 CLOSE_CONFIRM_SECONDS = 120   # tombol "Ya, tutup" kedaluwarsa: cegah klik tak sengaja di pesan lama
 
@@ -181,6 +185,7 @@ class LiveBot:
             self.resolve_shadows()
         self.maybe_daily_review(now)
         self.maybe_weekly_review(now)
+        self.maybe_scheduled_analysis(now)
 
     # ---------- sinyal ----------
     def frames(self, bsym: str) -> dict[str, pd.DataFrame]:
@@ -191,7 +196,7 @@ class LiveBot:
     def process_symbol(self, sym: str) -> None:
         p, bsym, meta = self.s.strategy, self.s.broker_symbol(sym), self.meta[sym]
         frames = self.frames(bsym)
-        f = compute_features(frames[p.entry_tf], frames[p.trend_tf], p)
+        f = compute_features(frames[p.entry_tf], frames[p.trend_tf], p, self.offset)
         if f.empty:
             return
         self.check_signal_exits(sym, bsym, f)
@@ -326,8 +331,10 @@ class LiveBot:
 
     # ---------- konfirmasi manual lewat Telegram ----------
     def ask_confirmation(self, sid: int, sym: str, sig: Signal, head: str, sl: float, tp_txt: str, price_fmt: str,
-                         equity: float, suggested: float, lot: float, ai_text: str) -> bool:
+                         equity: float, suggested: float, lot: float, ai_text: str,
+                         timeout_minutes: int | None = None, suggest_label: str = "Saran AI") -> bool:
         c = self.s.confirm
+        timeout_minutes = timeout_minutes or c.timeout_minutes
         rows = []
         streak = self.tilt_streak()
         seen = set()
@@ -347,14 +354,14 @@ class LiveBot:
         tilt = (f"⚠️ Cek tilt: {streak} rugi beruntun. Opsi di atas {self.s.risk.risk_per_trade * 100:g}% "
                 f"disembunyikan sampai ada trade untung.\n" if streak else "")
         text = (f"📈 {head}\nSL {sl:{price_fmt}} ({sig.sl_distance / pip:.0f} pip) | TP {tp_txt}\n{ai_text}\n\n"
-                f"{tilt}Saran AI: {suggested * 100:g}% → lot {lot} "
+                f"{tilt}{suggest_label}: {suggested * 100:g}% → lot {lot} "
                 f"(rugi di SL ${self.risk_amount(sym, lot, sig.sl_distance):.2f})\n"
-                f"Pilih dalam {c.timeout_minutes} menit, lewat dari itu otomatis batal:")
+                f"Pilih dalam {timeout_minutes} menit, lewat dari itu otomatis batal:")
         buttons = [rows[i:i + 2] for i in range(0, len(rows), 2)] + [[("❌ Tidak", f"c:{sid}:no")]]
         mid = self.notifier.send_buttons(text, buttons)
         if mid is None:
             return False
-        expires = datetime.now(timezone.utc) + timedelta(minutes=c.timeout_minutes)
+        expires = datetime.now(timezone.utc) + timedelta(minutes=timeout_minutes)
         self.journal.update_signal(sid, user_decision="pending", confirm_msg_id=mid,
                                    confirm_expires=expires.isoformat(timespec="seconds"))
         return True
@@ -469,10 +476,25 @@ class LiveBot:
         price = tick.ask if d == 1 else tick.bid
         atr = json.loads(row["snapshot"] or "{}").get("atr") or row["sl_distance"] / self.s.strategy.sl_atr_mult
         moved = abs(price - (row["ref_price"] or price)) / atr if atr else 0.0
+        sl_dist, tp_dist, setup_block = row["sl_distance"], row["tp_distance"], None
+        setup = json.loads(row["setup"]) if row["source"] == "ai_setup" and row["setup"] else None
+        if setup:
+            # Setup 📊 Analisis: harga harus di dalam zona entry; SL & TP tetap di level setup, bukan jarak dari fill
+            f = f".{meta['digits']}f"
+            tol = 0.1 * atr
+            sl_dist, tp_dist = d * (price - setup["stop_loss"]), d * (setup["take_profit_1"] - price)
+            moved = 0.0
+            if not setup["entry_low"] - tol <= price <= setup["entry_high"] + tol:
+                setup_block = (f"harga {price:{f}} di luar zona entry {setup['entry_low']:{f}}-{setup['entry_high']:{f}}; "
+                               f"tunggu harga masuk zona lalu minta analisis lagi")
+            elif sl_dist <= 0 or tp_dist <= 0:
+                setup_block = "harga sudah melewati SL/TP setup"
+            elif self.setups_today() >= self.s.confirm.max_setups_per_day:
+                setup_block = f"kuota {self.s.confirm.max_setups_per_day} setup/hari sudah terpakai"
 
         # Kondisi bisa berubah selama menunggu jawaban: cek ulang semuanya
         streak = self.tilt_streak()
-        block = (self.entry_block(sym, bsym, d, acc.equity, spread_pts) or self.news_block(bsym)
+        block = (self.entry_block(sym, bsym, d, acc.equity, spread_pts) or self.news_block(bsym) or setup_block
                  or (f"cek tilt: {streak} rugi beruntun, maksimal {self.s.risk.risk_per_trade * 100:g}%"
                      if not any(abs(risk - r) < 1e-9 for r in self.allowed_risk_options()) else None)
                  or (f"harga sudah bergerak {moved:.2f} ATR dari harga sinyal"
@@ -481,8 +503,8 @@ class LiveBot:
             self.finish_confirmation(row, "blocked", f"⏭️ Tidak dieksekusi: {block}")
             return
         try:
-            lot, fill = self.open_trade(row["id"], sym, d, row["sl_distance"], row["tp_distance"],
-                                        acc.equity, risk, "bot user")
+            lot, fill = self.open_trade(row["id"], sym, d, sl_dist, tp_dist, acc.equity, risk,
+                                        "bot user setup" if setup else "bot user")
         except MT5Error as e:
             self.finish_confirmation(row, "failed", f"⚠️ Order gagal: {e}")
             return
@@ -507,13 +529,13 @@ class LiveBot:
         else:
             cmd = "menu"
         {"status": self.cmd_status, "posisi": self.cmd_positions, "pnl": self.cmd_pnl, "sinyal": self.cmd_signals,
-         "pause": self.cmd_pause, "resume": self.cmd_resume, "menu": self.cmd_menu,
-         "start": self.cmd_menu}.get(cmd, self.cmd_help)()
+         "pause": self.cmd_pause, "resume": self.cmd_resume, "analisis": self.cmd_analysis,
+         "menu": self.cmd_menu, "start": self.cmd_menu}.get(cmd, self.cmd_help)()
 
     def menu_rows(self) -> list[list[str]]:
         """Saat dijeda tampilkan tombol Resume, selain itu Pause."""
         toggle = "▶️ Resume" if self.journal.get_state("paused") == "1" else "⏸️ Pause"
-        return [["📟 Status", "📂 Posisi"], ["📈 P/L", "🔔 Sinyal"], [toggle, "❓ Bantuan"]]
+        return [["📟 Status", "📂 Posisi"], ["📈 P/L", "🔔 Sinyal"], ["📊 Analisis", toggle], ["❓ Bantuan"]]
 
     def send_menu(self, text: str) -> None:
         self.notifier.send_keyboard(text, self.menu_rows())
@@ -595,7 +617,8 @@ class LiveBot:
             status = ("✅ dieksekusi" if r["executed"] else "⏳ menunggu konfirmasi" if r["user_decision"] == "pending"
                       else f"⏭️ {r['skip_reason'] or '-'}")
             ai = f" | AI {r['ai_decision']}" if r["ai_decision"] and r["ai_decision"] != "rule_only" else ""
-            lines.append(f"{when} {'BUY' if r['direction'] == 1 else 'SELL'} {r['symbol']}: {status}{ai}")
+            src = "📊 setup " if r["source"] == "ai_setup" else ""
+            lines.append(f"{when} {src}{'BUY' if r['direction'] == 1 else 'SELL'} {r['symbol']}: {status}{ai}")
         self.notify("🔔 5 sinyal terakhir (WIB)\n" + "\n".join(lines))
 
     def cmd_pause(self) -> None:
@@ -606,6 +629,146 @@ class LiveBot:
     def cmd_resume(self) -> None:
         self.journal.set_state("paused", "0")
         self.send_menu("▶️ Entry baru diizinkan lagi.")
+
+    # ---------- 📊 Analisis harian oleh Claude ----------
+    def cmd_analysis(self) -> None:
+        if self.llm is None:
+            self.notify("📊 Analisis butuh AI aktif (ai.enabled: true dan 9Router tersambung).")
+            return
+        since = time.time() - float(self.journal.get_state("analysis_last_ts") or 0)
+        if since < ANALYSIS_COOLDOWN:
+            self.notify(f"⏳ Analisis terakhir baru {since:.0f} detik lalu. Coba lagi dalam "
+                        f"{ANALYSIS_COOLDOWN - since:.0f} detik.")
+            return
+        self.journal.set_state("analysis_last_ts", f"{time.time():.0f}")
+        self.notify(f"⏳ Menganalisis {', '.join(self.meta)}... ±1-2 menit.")
+        try:
+            analysis = self.run_analysis()
+        except Exception as e:
+            log.warning("Analisis AI gagal: %s", e)
+            self.notify(f"⚠️ Analisis gagal: {e}")
+            return
+        now = datetime.now(timezone.utc).astimezone(WIB)
+        self.notify(f"📊 Analisis {now:%a %d/%m %H:%M} WIB\n\n{analysis.text}")
+        self.offer_setups(analysis)
+
+    def analysis_frames(self, bsym: str) -> dict[str, pd.DataFrame]:
+        out = {}
+        for tf, n in ANALYSIS_FRAMES.items():
+            try:
+                df = self.mt5.rates(bsym, tf, n)
+            except MT5Error as e:   # broker tanpa histori M5/M15: analisis tetap jalan dengan frame yang ada
+                log.warning("Frame %s %s tidak tersedia: %s", bsym, tf, e)
+                continue
+            if len(df):
+                out[tf] = df
+        return out
+
+    def run_analysis(self) -> Analysis:
+        """Kumpulkan snapshot semua pair, minta analisis Claude. Raise jika AI gagal / jawaban tidak valid."""
+        now = datetime.now(timezone.utc)
+        acc = self.mt5.account()
+        per_symbol, spreads = {}, {}
+        for sym, meta in self.meta.items():
+            bsym = self.s.broker_symbol(sym)
+            per_symbol[sym] = self.analysis_frames(bsym)
+            t = self.mt5.tick(bsym)
+            spreads[sym] = (t.ask - t.bid) / meta["point"]
+        positions = [{"symbol": p.symbol, "side": "BUY" if p.type == 0 else "SELL", "volume": p.volume,
+                      "open": p.price_open, "sl": p.sl, "tp": p.tp, "profit": round(p.profit, 2)}
+                     for p in self.mt5.positions(self.s.magic)]
+        recent = [{"symbol": r["symbol"], "side": "BUY" if r["direction"] == 1 else "SELL",
+                   "r": round(r["r_multiple"], 2) if r["r_multiple"] is not None else None,
+                   "closed": r["close_time"]} for r in self.journal.recent_closed(5)]
+        r = self.s.risk
+        rules = {"risk_per_trade_options_%": [o * 100 for o in self.s.confirm.risk_options],
+                 "max_daily_loss_%": r.max_daily_loss * 100, "today_pnl_%": round(100 * self.daily.pnl_pct(acc.equity), 2),
+                 "max_open_positions": r.max_open_positions, "min_reward_risk": 2,
+                 "execution": "market order by the bot only after the owner confirms and only while price is inside the entry zone"}
+        ctx = build_analysis_context(per_symbol, self.s.strategy, self.meta, spreads, now, self.offset,
+                                     self.calendar if self.calendar and self.calendar.available else None,
+                                     {"equity": round(acc.equity, 2), "balance": round(acc.balance, 2),
+                                      "currency": acc.currency}, positions, recent, rules)
+        return analyze_market(self.llm, ctx)
+
+    def setup_checks(self, analysis: Analysis) -> list[tuple]:
+        """[(setup, alasan_tidak_valid | None, atr_h1)] untuk setup yang pair-nya diperdagangkan bot."""
+        out = []
+        for st in analysis.setups:
+            if st.symbol not in self.meta:
+                continue
+            bars = self.mt5.rates(self.s.broker_symbol(st.symbol), "H1", 100)
+            atr_h1 = float((bars["high"] - bars["low"]).tail(14).mean()) if len(bars) else 0.0
+            out.append((st, validate_setup(st, atr_h1), atr_h1))
+        return out
+
+    def setups_today(self) -> int:
+        day = datetime.now(timezone.utc).astimezone(WIB).replace(hour=0, minute=0, second=0, microsecond=0)
+        return self.journal.setups_executed_since(day.astimezone(timezone.utc).isoformat(timespec="seconds"))
+
+    def offer_setups(self, analysis: Analysis) -> None:
+        """Setup yang lolos batas keras & confidence High/Medium ditawarkan lewat tombol konfirmasi yang sama
+        dengan sinyal strategi; sisanya hanya diberitahukan."""
+        for st, why, atr_h1 in self.setup_checks(analysis):
+            digits = self.meta[st.symbol]["digits"]
+            text = format_setup(st, digits)
+            if why:
+                self.notify(f"ℹ️ Setup tidak ditawarkan ({why}):\n{text}")
+            elif st.confidence == "Low":
+                self.notify(f"ℹ️ Setup confidence Low, tidak ditawarkan; tunggu konfirmasi:\n{text}")
+            else:
+                self.offer_setup(st, atr_h1, text)
+
+    def offer_setup(self, st, atr_h1: float, text: str) -> None:
+        sym, digits = st.symbol, self.meta[st.symbol]["digits"]
+        bsym, meta = self.s.broker_symbol(sym), self.meta[sym]
+        if self.setups_today() >= self.s.confirm.max_setups_per_day:
+            self.notify(f"🚫 Kuota {self.s.confirm.max_setups_per_day} setup/hari sudah terpakai, tidak ditawarkan:\n{text}")
+            return
+        acc = self.mt5.account()
+        tick = self.mt5.tick(bsym)
+        block = (self.entry_block(sym, bsym, st.direction, acc.equity, (tick.ask - tick.bid) / meta["point"])
+                 or self.news_block(bsym))
+        if block:
+            self.notify(f"🚫 Setup tidak ditawarkan ({block}):\n{text}")
+            return
+        now = datetime.now(timezone.utc)
+        bar_time = f"setup {now:%Y-%m-%dT%H:%M:%S} {st.entry_mid:.{digits}f}"   # unik per (symbol, bar_time)
+        sid = self.journal.log_signal(sym, st.direction, bar_time, st.entry_mid, st.sl_distance, st.tp_distance,
+                                      {"atr": atr_h1}, source="ai_setup", setup=st.model_dump())
+        self.journal.update_signal(sid, ref_price=st.entry_mid, ai_decision="analysis",
+                                   ai_confidence={"High": 0.8, "Medium": 0.5, "Low": 0.2}[st.confidence],
+                                   ai_reasons=[st.reason] if st.reason else [], ai_risks=[st.invalid_if] if st.invalid_if else [])
+        price_fmt = f".{digits}f"
+        suggested = self.s.risk.risk_per_trade
+        lot = self.lot_for(sym, acc.equity, suggested, st.sl_distance)
+        if lot == 0:
+            why = self.min_lot_reason(sym, acc.equity, st.sl_distance)
+            self.journal.update_signal(sid, skip_reason=why)
+            self.notify(f"🚫 Setup tidak ditawarkan ({why}):\n{text}")
+            return
+        sig = Signal(sym, st.direction, pd.Timestamp(now).tz_convert(None), st.entry_mid, atr_h1 or st.sl_distance,
+                     st.sl_distance, st.tp_distance, {"atr": atr_h1})
+        tp_txt = f"{st.take_profit_1:{price_fmt}}" + (
+            f" (TP2 {st.take_profit_2:{price_fmt}} dikelola manual)" if st.take_profit_2 is not None else "")
+        head = f"SETUP {st.side} {sym} | zona {st.entry_low:{price_fmt}}-{st.entry_high:{price_fmt}}"
+        ok = self.ask_confirmation(sid, sym, sig, head, st.stop_loss, tp_txt, price_fmt, acc.equity, suggested, lot,
+                                   text + "\nOrder market dikirim saat Anda klik, hanya jika harga masih di zona.",
+                                   timeout_minutes=min(self.s.confirm.timeout_minutes, st.valid_minutes),
+                                   suggest_label="Risiko dasar")
+        if not ok:
+            self.journal.update_signal(sid, skip_reason="pesan konfirmasi Telegram gagal terkirim")
+            self.journal.open_shadow(sid, st.entry_mid, st.stop_loss, st.take_profit_1)
+
+    def maybe_scheduled_analysis(self, now: datetime) -> None:
+        wib = now.astimezone(WIB)
+        if wib.weekday() >= 5 or wib.hour not in self.s.ai.analysis_hours_wib or self.llm is None:
+            return
+        key = f"analysis_auto:{wib:%Y-%m-%d:%H}"
+        if self.journal.get_state(key):
+            return
+        self.journal.set_state(key, "1")
+        self.cmd_analysis()
 
     def position_action(self, cq: dict) -> None:
         """Tombol per posisi: pc (minta konfirmasi), pcy (tutup), pcn (batal), be (SL ke breakeven)."""
@@ -693,7 +856,7 @@ class LiveBot:
             {"equity": round(acc.equity, 2), "balance": round(acc.balance, 2), "currency": acc.currency},
             positions, currency_exposure(open_list), self.daily.pnl_pct(acc.equity), recent,
             self.calendar.context(sig.symbol + self.s.symbol_suffix, datetime.now(timezone.utc))
-            if self.calendar else None)
+            if self.calendar else None, offset_hours=self.offset)
         return review_signal(self.llm, ctx, self.s.ai.on_failure, self.review_prompt)
 
     @staticmethod
@@ -749,7 +912,7 @@ class LiveBot:
         """Tren masih searah posisi: aturan exit strategi belum terpenuhi di bar terakhir (butuh exit_rule: signal)."""
         p = self.s.strategy
         frames = self.frames(pos.symbol)
-        f = compute_features(frames[p.entry_tf], frames[p.trend_tf], p)
+        f = compute_features(frames[p.entry_tf], frames[p.trend_tf], p, self.offset)
         flags = None if f.empty else exit_flags(f, p)
         if flags is None:
             return False
@@ -818,7 +981,7 @@ class LiveBot:
                 continue
             if sym not in features:
                 frames = self.frames(self.s.broker_symbol(sym))
-                features[sym] = compute_features(frames[p.entry_tf], frames[p.trend_tf], p)
+                features[sym] = compute_features(frames[p.entry_tf], frames[p.trend_tf], p, self.offset)
             f = features[sym]
             bar_time = pd.Timestamp(row["bar_time"])
             if f.empty:

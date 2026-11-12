@@ -66,7 +66,8 @@ def backtest_symbol(symbol: str, entry_df: pd.DataFrame, trend_df: pd.DataFrame,
         tp = entry + d * sig.tp_distance if sig.tp_distance > 0 else None
         be = p.breakeven_at_r * sig.sl_distance
         res = simulate_exit(o, h, l, spread, e, d, entry, sl, tp, be, p.trail_atr_mult * sig.atr,
-                            c, p.max_hold_bars, None if exits is None else exits[0 if d == 1 else 1])
+                            c, p.max_hold_bars, None if exits is None else exits[0 if d == 1 else 1],
+                            p.lock_at_r * sig.sl_distance, p.lock_fraction)
         if res is None:
             j = len(f) - 1
             exit_price = c[j] if d == 1 else c[j] + spread[j]
@@ -90,9 +91,9 @@ def to_frame(trades: list[BTTrade]) -> pd.DataFrame:
 
 
 def simulate_portfolio(trades: pd.DataFrame, initial: float, risk: float, max_open: int,
-                       start: pd.Timestamp | None = None) -> tuple[pd.DataFrame, pd.Series]:
+                       start: pd.Timestamp | None = None, max_per_day: int = 0) -> tuple[pd.DataFrame, pd.Series]:
     """Gabungkan trade semua simbol: risiko = risk x equity terealisasi saat entry,
-    dan trade dilewati jika sudah ada max_open posisi terbuka.
+    dan trade dilewati jika sudah ada max_open posisi terbuka atau entry hari itu sudah max_per_day (0 = tanpa batas).
     Return (trade yang diambil + kolom pnl, kurva equity berindeks waktu exit)."""
     if trades.empty:
         return trades.assign(pnl=[]), pd.Series([initial], index=[start or pd.Timestamp(0)])
@@ -111,10 +112,13 @@ def simulate_portfolio(trades: pd.DataFrame, initial: float, risk: float, max_op
             equity += pnl[row]
             curve.append((exit_time, equity))
 
+    per_day: dict = {}
     for row in t.itertuples():
         realize(row.entry_time)
-        if len(open_) >= max_open:
+        day = row.entry_time.date()
+        if len(open_) >= max_open or (max_per_day and per_day.get(day, 0) >= max_per_day):
             continue
+        per_day[day] = per_day.get(day, 0) + 1
         open_.append((row.exit_time, row.Index, equity * risk))
         taken.append(row.Index)
     realize(None)

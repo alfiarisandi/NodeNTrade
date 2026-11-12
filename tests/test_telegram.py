@@ -1,4 +1,5 @@
 """Perintah & tombol Telegram: hanya dari chat yang diizinkan, pause, tutup 2 langkah, antrean kirim ulang."""
+import json
 import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -73,10 +74,64 @@ def test_menu_buttons_run_commands(bot):
     assert "#5" in bot.notifier.msgs[-1]
     say(bot, "⏸️ Pause")
     assert bot.journal.get_state("paused") == "1"
-    assert "▶️ Resume" in bot.notifier.menus[-1][-1]      # tombol toggle berganti
+    assert "▶️ Resume" in bot.notifier.menus[-1][2]      # tombol toggle berganti
     say(bot, "▶️ Resume")
     assert bot.journal.get_state("paused") == "0"
-    assert "⏸️ Pause" in bot.notifier.menus[-1][-1]
+    assert "⏸️ Pause" in bot.notifier.menus[-1][2]
+
+
+class FakeAnalysisLLM:
+    def __init__(self, setups=()):
+        self.calls = 0
+        self.reply = json.dumps({"text": "MARKET OVERVIEW\nEURUSD naik", "setups": list(setups)})
+
+    def complete(self, system, user):
+        self.calls += 1
+        snap = json.loads(user.split("\n", 1)[1])
+        assert "EURUSD" in snap["symbols"] and "session" in snap
+        return self.reply
+
+
+GOOD_SETUP = dict(symbol="EURUSD", side="BUY", entry_low=1.1990, entry_high=1.2010, stop_loss=1.1950,
+                  take_profit_1=1.2110, take_profit_2=1.2200, confidence="High", reason="BOS naik", wait_for="pin bar",
+                  invalid_if="close < 1.1950", valid_minutes=90)
+
+
+def test_analysis_button_sends_text_and_respects_cooldown(bot):
+    bot.llm = FakeAnalysisLLM([dict(GOOD_SETUP, take_profit_1=1.2030)])   # RR 0.6 -> ditolak batas keras
+    say(bot, "📊 Analisis")
+    msgs = bot.notifier.msgs
+    assert msgs[-3].startswith("⏳ Menganalisis") and "EURUSD naik" in msgs[-2]
+    assert msgs[-1].startswith("ℹ️ Setup tidak ditawarkan (RR 0.6 < 2)") and bot.llm.calls == 1
+    say(bot, "📊 Analisis")
+    assert "Coba lagi dalam" in bot.notifier.msgs[-1] and bot.llm.calls == 1
+    assert "📊 Analisis" in bot.menu_rows()[2]
+
+
+def test_analysis_without_llm_and_failure(bot):
+    bot.llm = None
+    say(bot, "/analisis")
+    assert "butuh AI aktif" in bot.notifier.msgs[-1]
+
+    class Broken:
+        def complete(self, system, user):
+            raise RuntimeError("9Router mati")
+
+    bot.llm = Broken()
+    bot.journal.set_state("analysis_last_ts", "0")
+    say(bot, "/analisis")
+    assert "Analisis gagal: 9Router mati" in bot.notifier.msgs[-1]
+
+
+def test_scheduled_analysis_once_per_hour(bot, tsettings):
+    bot.s = tsettings.model_copy(update={"ai": tsettings.ai.model_copy(update={"analysis_hours_wib": [14]})})
+    bot.llm = FakeAnalysisLLM()
+    wed_14_wib = datetime(2026, 1, 14, 7, 0, tzinfo=timezone.utc)
+    bot.maybe_scheduled_analysis(wed_14_wib)
+    bot.maybe_scheduled_analysis(wed_14_wib)
+    bot.maybe_scheduled_analysis(datetime(2026, 1, 14, 8, 0, tzinfo=timezone.utc))    # 15 WIB: bukan jadwal
+    bot.maybe_scheduled_analysis(datetime(2026, 1, 17, 7, 0, tzinfo=timezone.utc))    # Sabtu
+    assert bot.llm.calls == 1
 
 
 def test_free_text_and_start_show_menu(bot):

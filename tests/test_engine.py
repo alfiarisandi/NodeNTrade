@@ -45,3 +45,15 @@ def test_simulate_account_min_lot_and_risk_cap():
     taken, eq = simulate_account(pd.DataFrame(rows), {"EURUSD": meta}, 100, 0.0025, 0.01, 3)
     assert len(taken) == 1 and taken["lot"].iloc[0] == 0.01      # dipaksa lot min (0.5% <= 1%)
     assert abs(eq.iloc[-1] - 100.5) < 1e-9                       # trade kedua (3%) dilewati
+
+
+def test_portfolio_max_trades_per_day():
+    import pandas as pd
+    from bot.backtest.engine import simulate_portfolio
+
+    entries = pd.to_datetime(["2024-01-01 08:00", "2024-01-01 09:00", "2024-01-01 10:00", "2024-01-02 08:00"])
+    t = pd.DataFrame({"symbol": ["EURUSD", "XAUUSD", "EURUSD", "EURUSD"], "entry_time": entries,
+                      "exit_time": entries + pd.Timedelta(minutes=30), "r_net": [1.0, 1.0, 1.0, 1.0]})
+    assert len(simulate_portfolio(t, 1000, 0.01, 5)[0]) == 4
+    taken, _ = simulate_portfolio(t, 1000, 0.01, 5, max_per_day=2)
+    assert list(taken["entry_time"]) == [entries[0], entries[1], entries[3]]

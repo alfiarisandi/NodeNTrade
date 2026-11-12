@@ -39,7 +39,7 @@ def main() -> None:
         if args.balance:   # lot nyata: lot minimum dipakai bila risikonya <= min_lot_max_risk
             return simulate_account(tp, metas, initial, risk.risk_per_trade,
                                     max(risk.risk_per_trade, risk.min_lot_max_risk), max_open)
-        return simulate_portfolio(tp, initial, risk.risk_per_trade, max_open)
+        return simulate_portfolio(tp, initial, risk.risk_per_trade, max_open, max_per_day=risk.max_trades_per_day)
 
     trades = run_all(s, names, data_dir)
     trades = trades[(trades["signal_time"] >= start) & (trades["signal_time"] <= end)]

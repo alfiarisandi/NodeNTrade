@@ -6,6 +6,8 @@
   python scripts/variants.py --family cf           # Ichimoku H4 + filter MA / MACD / ATR
   python scripts/variants.py --family dt           # day trade 1-3 hari, akun $100 lot 0.01 (5 pair volatilitas rendah)
   python scripts/variants.py --family sm           # Ichimoku H4 + MA200 di akun $100 (profil settings.small.yaml)
+  python scripts/variants.py --family ex           # proteksi profit (BE / trailing / kunci / TP) di setelan live
+  python scripts/variants.py --family dd           # day trade spek Daily Trading Strategist (EMA50/200, PDH, range Asia, RR 2)
   python scripts/variants.py --validate NAMA       # varian terpilih di out-of-sample 2024-sekarang
 """
 import argparse
@@ -16,7 +18,7 @@ from _common import setup_logging
 
 from bot.backtest.engine import run_all, simulate_account, simulate_portfolio
 from bot.backtest.report import metrics
-from bot.config import SymbolCfg, load_settings
+from bot.config import SessionCfg, SymbolCfg, load_settings
 
 NO_FILTER = {"adx_min": 0, "rsi_buy_max": 101, "rsi_sell_min": -1}
 SWING = {"entry_tf": "H4", "trend_tf": "D1", "session_hours": False, "breakeven_at_r": 0}
@@ -138,15 +140,62 @@ DY_VARIANTS: dict[str, dict] = {
                           "session_hours": True},
 }
 
+# Proteksi profit di atas setelan live (config/settings.yaml, pair live): breakeven, trailing ATR, kunci persentase, TP.
+# Catatan: risk.take_profit_usd / trail_lock_fraction tidak dimodelkan backtest; padanannya ex_kunci* (akun $10k,
+# risiko 0.5% -> $25 = 0.5R) dan ex_TP0.5R (tutup di $25 tanpa trail).
+EX_VARIANTS: dict[str, dict] = {
+    "ex_live_tanpa_kunci": {},
+    "ex_kunci0.5R_60%": {"lock_at_r": 0.5, "lock_fraction": 0.6},
+    "ex_kunci1R_50%": {"lock_at_r": 1.0, "lock_fraction": 0.5},
+    "ex_kunci1R_70%": {"lock_at_r": 1.0, "lock_fraction": 0.7},
+    "ex_kunci2R_50%": {"lock_at_r": 2.0, "lock_fraction": 0.5},
+    "ex_BE0.5R": {"breakeven_at_r": 0.5},
+    "ex_BE1R": {"breakeven_at_r": 1.0},
+    "ex_trail2ATR": {"trail_atr_mult": 2.0},
+    "ex_trail3ATR": {"trail_atr_mult": 3.0},
+    "ex_trail4ATR": {"trail_atr_mult": 4.0},
+    "ex_BE1R_trail3ATR": {"breakeven_at_r": 1.0, "trail_atr_mult": 3.0},
+    "ex_TP0.5R": {"tp_r": 0.5},
+    "ex_TP2R": {"tp_r": 2.0},
+    "ex_TP3R": {"tp_r": 3.0},
+}
+
+# Day trade versi spek "Daily Trading Strategist": EURUSD + XAUUSD, $10k, risiko 0.5%, sesi London+NY (07-20 UTC),
+# tren D1 EMA200 + close di sisi EMA200 H1, SL di level (maks 1.5 ATR), TP 2R, tutup paksa 24 bar, maks 3 entry/hari.
+# Varian menambah filter EMA50 (ma50_filter) dan konfirmasi candle (engulfing / pin bar) di bar sinyal.
+# HASIL 2026-11-12: GAGAL gerbang (OOS PF > 1.2, DD < 15%, >= 100 trade, kedua pair PF > 1). In-sample 2019-2023 semua
+# PF < 1 (0.63-0.98); out-of-sample 2024-2026 terbaik dd_pdh_2R PF 1.09 (+27R, DD 13%), EURUSD selalu PF < 1.
+# Konfirmasi candle memangkas 80-90% sinyal dan memperburuk hasil. Tidak dilanjutkan ke live.
+DD_SYMBOLS = ["EURUSD", "XAUUSD"]
+DD = {"entry_tf": "H1", "trend_tf": "D1", "trend_filter": "with", "ma_filter": True, "session_hours": True,
+      "max_hold_bars": 24, "breakeven_at_r": 0, "adx_min": 0, "rsi_buy_max": 101, "rsi_sell_min": -1,
+      "exit_rule": "stops", "trail_atr_mult": 0, "sl_mode": "level", "sl_atr_mult": 1.5, "tp_r": 2.0}
+DD_RB = {**DD, "entry_type": "range_breakout"}
+DD_PDH = {**DD, "entry_type": "pdh_breakout", "entry_window_end_utc": 20}
+DD_PB = {**DD, "entry_type": "pullback", "ema_fast": 20, "ema_slow": 50, "sl_mode": "atr"}
+DD_VARIANTS: dict[str, dict] = {
+    "dd_london_2R": DD_RB,
+    "dd_london_2R_ma50": {**DD_RB, "ma50_filter": True},
+    "dd_london_2R_engulf": {**DD_RB, "candle_confirm": "engulfing"},
+    "dd_london_2R_candle": {**DD_RB, "candle_confirm": "any"},
+    "dd_london_3R": {**DD_RB, "tp_r": 3.0},
+    "dd_pdh_2R": DD_PDH,
+    "dd_pdh_2R_ma50": {**DD_PDH, "ma50_filter": True},
+    "dd_pdh_2R_engulf": {**DD_PDH, "candle_confirm": "engulfing"},
+    "dd_pullback_2R_ma50": {**DD_PB, "ma50_filter": True},
+    "dd_pullback_2R_engulf": {**DD_PB, "candle_confirm": "engulfing"},
+}
+
 VARIANTS = {**TREND_VARIANTS, **MR_VARIANTS, **OS_VARIANTS, **CF_VARIANTS, **DT_VARIANTS, **SM_VARIANTS,
-            **DY_VARIANTS}
+            **DY_VARIANTS, **EX_VARIANTS, **DD_VARIANTS}
 
 
 def evaluate(s, names, data_dir, start, end) -> tuple[dict, dict]:
     trades = run_all(s, names, data_dir)
     trades = trades[(trades["signal_time"] >= start) & (trades["signal_time"] < end)]
     bt, risk = s.backtest, s.risk
-    taken, eq = simulate_portfolio(trades, bt.initial_balance, risk.risk_per_trade, risk.max_open_positions)
+    taken, eq = simulate_portfolio(trades, bt.initial_balance, risk.risk_per_trade, risk.max_open_positions,
+                                   max_per_day=risk.max_trades_per_day)
     port = metrics(taken, eq, bt.initial_balance)
     per_symbol = {}
     for name in names:
@@ -187,10 +236,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="2024-01-01")
     ap.add_argument("--from", dest="start", default="2019-01-01")
-    ap.add_argument("--family", choices=["tf", "mr", "os", "cf", "dt", "sm", "dy"], default="tf",
+    ap.add_argument("--family", choices=["tf", "mr", "os", "cf", "dt", "sm", "dy", "ex", "dd"], default="tf",
                     help="tf = trend following, mr = mean reversion, os = strategi open source, "
                          "cf = Ichimoku H4 + filter MA/MACD/ATR, dt = day trade akun kecil, "
-                         "sm = Ichimoku H4 + MA200 akun kecil")
+                         "sm = Ichimoku H4 + MA200 akun kecil, ex = proteksi profit di setelan live, "
+                         "dd = day trade spek Daily Trading Strategist (EURUSD+XAUUSD)")
     ap.add_argument("--balance", type=float, default=100.0, help="modal awal untuk family dt / sm")
     ap.add_argument("--symbols", nargs="*", help="pair untuk family dt / sm (default: DT_SYMBOLS / SM_SYMBOLS)")
     ap.add_argument("--validate", metavar="NAMA", choices=list(VARIANTS))
@@ -206,6 +256,12 @@ def main() -> None:
     elif day_trade:
         names = args.symbols or DT_SYMBOLS
         base = dt_settings(base, names)
+    elif args.family == "dd" or args.validate in DD_VARIANTS:
+        names = args.symbols or DD_SYMBOLS
+        base = base.model_copy(update={
+            "symbols": [SymbolCfg(name=n, max_spread_points=50 if n == "XAUUSD" else 25) for n in names],
+            "session": SessionCfg(start_hour_utc=7, end_hour_utc=20, friday_cutoff_hour_utc=18),
+            "risk": base.risk.model_copy(update={"max_open_positions": 2, "max_trades_per_day": 3})})
     elif args.family == "dy" or args.validate in DY_VARIANTS:
         names = args.symbols or DY_PAIRS
         base = base.model_copy(update={"symbols": [SymbolCfg(name=n, max_spread_points=50 if n == "XAUUSD" else 25)
@@ -220,7 +276,8 @@ def main() -> None:
         start, end, label = split, pd.Timestamp.max, "OUT-OF-SAMPLE"
     else:
         chosen = {"tf": TREND_VARIANTS, "mr": MR_VARIANTS, "os": OS_VARIANTS, "cf": CF_VARIANTS,
-                  "dt": DT_VARIANTS, "sm": SM_VARIANTS, "dy": DY_VARIANTS}[args.family]
+                  "dt": DT_VARIANTS, "sm": SM_VARIANTS, "dy": DY_VARIANTS, "ex": EX_VARIANTS,
+                  "dd": DD_VARIANTS}[args.family]
         start, end, label = pd.Timestamp(args.start), split, "IN-SAMPLE"
 
     rows, pairs = {}, {}

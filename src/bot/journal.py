@@ -80,7 +80,9 @@ class Journal:
         """Tambah kolom baru ke database lama tanpa menghapus data."""
         have = {r["name"] for r in self.db.execute("PRAGMA table_info(signals)")}
         for col, typ in [("ref_price", "REAL"), ("user_decision", "TEXT"), ("user_risk", "REAL"),
-                         ("confirm_msg_id", "INTEGER"), ("confirm_expires", "TEXT")]:
+                         ("confirm_msg_id", "INTEGER"), ("confirm_expires", "TEXT"),
+                         ("source", "TEXT DEFAULT 'rule'"),   # rule = sinyal strategi | ai_setup = setup 📊 Analisis
+                         ("setup", "TEXT")]:                  # JSON setup Claude (zona, TP1/TP2, timeframe, alasan)
             if col not in have:
                 self.db.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
 
@@ -96,13 +98,20 @@ class Journal:
         return cur.fetchone() is not None
 
     def log_signal(self, symbol: str, direction: int, bar_time: str, entry_ref: float,
-                   sl_distance: float, tp_distance: float, snapshot: dict) -> int:
+                   sl_distance: float, tp_distance: float, snapshot: dict, source: str = "rule",
+                   setup: dict | None = None) -> int:
         cur = self.db.execute(
-            "INSERT INTO signals (created_at, symbol, direction, bar_time, entry_ref, sl_distance, tp_distance, snapshot)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (_now(), symbol, direction, bar_time, entry_ref, sl_distance, tp_distance, json.dumps(snapshot)))
+            "INSERT INTO signals (created_at, symbol, direction, bar_time, entry_ref, sl_distance, tp_distance, snapshot,"
+            " source, setup) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (_now(), symbol, direction, bar_time, entry_ref, sl_distance, tp_distance, json.dumps(snapshot), source,
+             json.dumps(setup, ensure_ascii=False) if setup is not None else None))
         self.db.commit()
         return cur.lastrowid
+
+    def setups_executed_since(self, iso_ts: str) -> int:
+        """Jumlah setup 📊 Analisis yang benar-benar dieksekusi sejak iso_ts (kuota harian)."""
+        return self.db.execute("SELECT COUNT(*) FROM signals WHERE source='ai_setup' AND executed=1 AND created_at >= ?",
+                               (iso_ts,)).fetchone()[0]
 
     def update_signal(self, signal_id: int, **fields) -> None:
         for k in ("ai_reasons", "ai_risks"):
@@ -178,18 +187,23 @@ class Journal:
         """Bandingkan hasil (dalam R) sinyal yang diloloskan vs ditolak AI.
         Sinyal dry-run/ditolak dinilai dari shadow trade; trade nyata dari r_multiple."""
         rows = self.db.execute("""
-            SELECT s.ai_decision, s.user_decision, s.executed, s.shadow_r, t.r_multiple
+            SELECT s.ai_decision, s.user_decision, s.executed, s.shadow_r, s.source, t.r_multiple
             FROM signals s LEFT JOIN trades t ON t.signal_id = s.id
             WHERE s.shadow_status NOT IN ('none', 'open', 'expired') OR t.status = 'closed'
         """).fetchall()
         groups: dict[str, list[float]] = {}
         for r in rows:
             val = r["r_multiple"] if r["r_multiple"] is not None else r["shadow_r"]
+            if r["source"] == "ai_setup":   # setup Claude dinilai terpisah dari sinyal strategi
+                groups.setdefault("setup_ai_semua", []).append(val)
+                if r["user_decision"] in ("approved", "declined", "expired", "blocked"):
+                    groups.setdefault(f"setup_ai_user_{r['user_decision']}", []).append(val)
+                continue
             key = {"reject": "ditolak_ai", "news_block": "diblok_berita"}.get(r["ai_decision"], "diloloskan")
             groups.setdefault(key, []).append(val)
             if r["user_decision"] in ("approved", "declined", "expired"):
                 groups.setdefault(f"user_{r['user_decision']}", []).append(val)
-        allr = [v for k, vs in groups.items() if not k.startswith("user_") for v in vs]
+        allr = [v for k, vs in groups.items() if not k.startswith(("user_", "setup_ai")) for v in vs]
         summary = {k: {"n": len(v), "total_R": round(sum(v), 2), "avg_R": round(sum(v) / len(v), 3)}
                    for k, v in groups.items()}
         if allr:

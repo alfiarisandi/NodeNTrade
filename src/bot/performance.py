@@ -56,6 +56,7 @@ def weekly_stats(journal: Journal, since_iso: str, dd_info: dict) -> dict:
         "period_start_utc": since_iso,
         "signals": {
             "total": len(signals),
+            "by_source": dict(Counter(s["source"] or "rule" for s in signals)),
             "ai_decision": dict(Counter(s["ai_decision"] or "dilewati_aturan_risiko" for s in signals)),
             "user_decision": dict(Counter(s["user_decision"] for s in signals if s["user_decision"])),
             "skip_reasons": dict(Counter((s["skip_reason"] or "").split(":")[0] for s in signals

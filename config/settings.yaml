@@ -65,7 +65,10 @@ risk:
   max_drawdown_from_peak: 0.15
   # Cek tilt: setelah 3 rugi beruntun, tombol risiko di atas risk_per_trade (0.5%) disembunyikan (0 = nonaktif)
   tilt_losing_streak: 3
-  take_profit_usd: 25       # tutup posisi saat profit floating >= $25 (0 = nonaktif)
+  # Backtest proteksi profit 2026-11-12 (scripts/variants.py --family ex, EURUSD+XAUUSD): semua kunci profit dini
+  # MENURUNKAN total R dibanding keluar lewat sinyal saja (in-sample 31.6R, out-of-sample 22.8R). Padanan aturan
+  # $25 + kunci 60% (= 0.5R di akun $10k risiko 0.5%): 3.5R / 11.2R. Tutup di $25 tanpa trail: -1.6R / 3.1R.
+  take_profit_usd: 0        # tutup posisi saat profit floating >= $N (0 = nonaktif; dimatikan 2026-11-12, lihat di atas)
   max_hold_days: 0          # tutup paksa setelah N hari (0 = nonaktif). Backtest: batas 3 hari menurunkan PF 1.22 -> 1.12
   trail_lock_fraction: 0.6  # profit >= $25 & tren masih searah: tidak ditutup, SL dikunci di 60% gerak profit (0 = tutup di $25)
 
@@ -77,6 +80,9 @@ ai:
   daily_review_hour_utc: 21
   weekly_review_weekday: 4      # laporan mingguan tiap Jumat (UTC) ...
   weekly_review_hour_utc: 21    # ... pukul 21:00 UTC = Sabtu 04:00 WIB
+  # Analisis XAUUSD & EURUSD otomatis (sama seperti tombol 📊 Analisis) di jam WIB ini, Senin-Jumat.
+  # Kosong = hanya saat tombol ditekan. Contoh: [14, 20] = jelang buka London & New York.
+  analysis_hours_wib: []
 
 backtest:
   initial_balance: 10000
@@ -99,6 +105,7 @@ confirm:
   timeout_minutes: 30           # tidak dijawab = batal (dicatat sebagai shadow trade)
   risk_options: [0.0025, 0.005, 0.01]   # tombol 0.25% / 0.5% / 1% (batas keras maks 1%)
   max_price_move_atr: 0.5       # batal jika harga sudah bergerak > 0.5 ATR dari harga sinyal
+  max_setups_per_day: 3         # setup dari 📊 Analisis yang boleh dieksekusi per hari WIB (spek: maks 2-3 trade/hari)
 
 journal_path: data/journal.db
 data_dir: data

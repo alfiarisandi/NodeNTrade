@@ -8,6 +8,7 @@
   python scripts/run_bot.py --export             ekspor jurnal ke CSV + bandingkan AI vs aturan
   python scripts/run_bot.py --news               kalender ekonomi minggu ini & pair yang sedang diblok
   python scripts/run_bot.py --weekly-report      tampilkan laporan mingguan sekarang (tanpa kirim Telegram)
+  python scripts/run_bot.py --analysis           analisis XAUUSD & EURUSD oleh Claude (sama dengan tombol 📊, tanpa Telegram)
   python scripts/run_bot.py --reset-dd           reset circuit breaker drawdown (puncak = equity terbaru)
 
   Profil lain: --config config/settings.small.yaml (atau BOT_CONFIG=... di .env), mis. akun $100.
@@ -101,9 +102,11 @@ def test_review(s, symbol: str) -> None:
         cal = make_calendar(s)
         if cal:
             cal.refresh(datetime.now(timezone.utc))
-        frames = {"H1": mt5c.rates(bsym, "H1", 600), "H4": mt5c.rates(bsym, "H4", 600),
-                  "D1": mt5c.rates(bsym, "D1", 400)}
-        f = compute_features(frames[s.strategy.entry_tf], frames[s.strategy.trend_tf], s.strategy)
+        offset = mt5c.server_utc_offset(bsym)
+        offset = 2 if offset is None else offset
+        frames = {tf: mt5c.rates(bsym, tf, n) for tf, n in
+                  {"H1": 600, "H4": 600, "D1": 400, s.strategy.entry_tf: 600, s.strategy.trend_tf: 600}.items()}
+        f = compute_features(frames[s.strategy.entry_tf], frames[s.strategy.trend_tf], s.strategy, offset)
         row = f.iloc[-1]
         d = 1 if row["trend"] >= 0 else -1
         sig = Signal(symbol, d, row["time"], float(row["close"]), float(row["atr"]),
@@ -113,7 +116,8 @@ def test_review(s, symbol: str) -> None:
         ctx = build_review_context(sig, frames, s.strategy, meta, t.ask if d == 1 else t.bid,
                                    (t.ask - t.bid) / meta["point"], datetime.now(timezone.utc).hour,
                                    {"equity": acc.equity, "currency": acc.currency}, [], {}, 0.0, [],
-                                   cal.context(bsym, datetime.now(timezone.utc)) if cal else None)
+                                   cal.context(bsym, datetime.now(timezone.utc)) if cal else None,
+                                   offset_hours=offset)
         print(f"Sinyal contoh: {sig.side} {symbol} (konteks {len(ctx)} karakter)")
         out = review_signal(ClaudeLLM(s.ai), ctx, s.ai.on_failure,
                             review_system(s.strategy, s.risk.risk_per_trade))
@@ -191,6 +195,35 @@ def weekly_report_now(s) -> None:
         print(f"\n(Claude tidak tersedia: {e})\n" + format_weekly_fallback(st))
 
 
+def analysis_now(s) -> None:
+    """Analisis harian Claude dari data MT5 live, dicetak ke layar (tidak ada order, tidak ada Telegram)."""
+    from bot.ai.analysis import format_setup
+    from bot.config import TelegramCfg
+    from bot.live import LiveBot
+
+    mt5c = MT5Client(s.mt5)
+    mt5c.connect()
+    try:
+        bot = LiveBot(s, mt5c, Journal(s.path(s.journal_path)), Notifier(TelegramCfg()), ClaudeLLM(s.ai), True,
+                      make_calendar(s))
+        for sym in s.symbols:
+            bot.meta[sym.name] = mt5c.symbol_meta(s.broker_symbol(sym.name))
+        offset = s.session.server_utc_offset_hours
+        if offset is None:
+            offset = mt5c.server_utc_offset(s.broker_symbol(s.symbols[0].name))
+        bot.offset = bot.offset if offset is None else offset
+        if bot.calendar:
+            bot.calendar.refresh(__import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        print("Meminta analisis Claude (±1-2 menit)...")
+        a = bot.run_analysis()
+        print("\n--- Analisis ---\n" + a.text)
+        print(f"\n--- Setup terstruktur ({len(a.setups)}) ---")
+        for st, why, _ in bot.setup_checks(a):
+            print(f"{'✅ layak ditawarkan' if why is None else '⛔ ' + why}\n{format_setup(st, bot.meta[st.symbol]['digits'])}\n")
+    finally:
+        mt5c.shutdown()
+
+
 def run(s, dry_run: bool) -> None:
     from bot.live import LiveBot
 
@@ -218,6 +251,7 @@ def main() -> None:
     g.add_argument("--export", action="store_true")
     g.add_argument("--news", action="store_true")
     g.add_argument("--weekly-report", action="store_true")
+    g.add_argument("--analysis", action="store_true")
     g.add_argument("--reset-dd", action="store_true")
     ap.add_argument("--config", help="file settings (default: BOT_CONFIG di .env, atau config/settings.yaml)")
     args = ap.parse_args()
@@ -241,6 +275,9 @@ def dispatch(args, s) -> None:
         test_review(s, args.test_review.upper())
     elif args.weekly_report:
         weekly_report_now(s)
+    elif args.analysis:
+        setup_logging()
+        analysis_now(s)
     elif args.reset_dd:
         reset_dd(s)
     elif args.news:

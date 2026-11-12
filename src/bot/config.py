@@ -58,10 +58,17 @@ class StrategyCfg(BaseModel):
     sl_atr_mult: float = 1.5
     tp_atr_mult: float = 3.0
     breakeven_at_r: float = 1.0
+    # Kunci profit: setelah profit floating mencapai lock_at_r (x R), SL mengikuti di lock_fraction dari
+    # profit maksimum yang pernah dicapai (0 = nonaktif). Padanan backtest untuk risk.take_profit_usd + trail_lock_fraction.
+    lock_at_r: float = 0.0
+    lock_fraction: float = 0.0
     # Filter konfirmasi tambahan (berlaku untuk entry_type apa pun; default nonaktif)
     ma_filter: bool = False       # buy hanya jika close > EMA(ema_trend) di timeframe entry, sell sebaliknya
     macd_filter: bool = False     # buy hanya jika MACD(12,26,9) > garis sinyal, sell sebaliknya
     atr_ratio_min: float = 0.0    # hanya entry jika ATR / rata-rata ATR 50 bar >= nilai ini (0 = nonaktif)
+    ma50_filter: bool = False     # buy hanya jika close > EMA(ema_slow) (= EMA50) di timeframe entry, sell sebaliknya
+    # Bar sinyal harus pola candle searah: engulfing | pin (pin bar) | any (salah satu) | none
+    candle_confirm: Literal["none", "engulfing", "pin", "any"] = "none"
     # Day trade (jam UTC): range dari range_start..range_end, entry hanya sampai entry_window_end
     range_start_utc: int = 0
     range_end_utc: int = 7
@@ -83,6 +90,7 @@ class RiskCfg(BaseModel):
     max_daily_loss: float = Field(0.03, gt=0, le=0.10)
     max_open_positions: int = Field(3, ge=1, le=10)
     max_currency_exposure: int = Field(2, ge=1)
+    max_trades_per_day: int = Field(0, ge=0)   # entry per hari lintas simbol (0 = tanpa batas); baru dipakai backtest
     # Circuit breaker: stop entry baru jika equity turun sejauh ini dari puncaknya (reset manual)
     max_drawdown_from_peak: float = Field(0.15, gt=0, le=0.5)
     # Akun kecil: jika lot dari risk_per_trade di bawah lot minimum broker, pakai lot minimum selama
@@ -105,6 +113,8 @@ class AICfg(BaseModel):
     daily_review_hour_utc: int = 21
     weekly_review_weekday: int = Field(4, ge=0, le=6)   # 0 = Senin ... 4 = Jumat (UTC)
     weekly_review_hour_utc: int = Field(21, ge=0, le=23)
+    # Analisis harian otomatis (tombol 📊 Analisis) di jam-jam WIB ini, hari kerja; kosong = hanya saat diminta
+    analysis_hours_wib: list[int] = Field(default_factory=list)
     base_url: str = ""
     api_key: str = ""
     model: str = ""
@@ -146,6 +156,7 @@ class ConfirmCfg(BaseModel):
     timeout_minutes: int = Field(30, ge=1, le=240)
     risk_options: list[float] = [0.0025, 0.005, 0.01]
     max_price_move_atr: float = 0.5   # batalkan jika harga sudah bergerak > N x ATR dari harga sinyal
+    max_setups_per_day: int = Field(3, ge=0, le=10)   # setup 📊 Analisis yang boleh dieksekusi per hari (WIB)
 
     @field_validator("risk_options")
     @classmethod

@@ -24,7 +24,7 @@ class FakeMT5:
 
     def rates(self, symbol, tf, count):
         # Kembalikan seluruh data (bukan tail) agar indikator identik dengan fixture
-        df = {"H1": self.h1, "H4": self.h4, "D1": self.h4}[tf]
+        df = {"H1": self.h1, "H4": self.h4, "D1": self.h4}.get(tf, self.h1)   # M15/M5 palsu = data H1
         return (df.tail(1) if count == 1 else df).reset_index(drop=True)
 
     def tick(self, symbol):

@@ -62,3 +62,15 @@ def test_timeout_skips_by_default():
 
 def test_rule_only_fallback():
     assert review_signal(FakeLLM(exc=LLMError("down")), "{}", on_failure="rule_only").multiplier == 1.0
+
+
+def test_review_prompt_covers_structure_levels_and_timeframes():
+    from bot.ai.prompts import review_system
+    from bot.config import StrategyCfg
+
+    s = review_system(StrategyCfg(entry_type="ichimoku", entry_tf="H4", trend_tf="D1", tp_atr_mult=0), 0.005)
+    assert "D1 (trend), H4 (entry) and H1" in s and "Counter-trend against the D1 trend" in s
+    for key in ("key_levels", "structure", "CHoCH", "candles_H4", "session", "DXY", "exits on its own signal"):
+        assert key in s
+    s2 = review_system(StrategyCfg(entry_tf="H1", trend_tf="D1", tp_r=2.0), 0.01)
+    assert "D1 (trend), H1 (entry)" in s2 and "and H1" not in s2 and "take profit are fixed" in s2

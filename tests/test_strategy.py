@@ -72,6 +72,16 @@ def test_trailing_stop_locks_profit():
     assert (j, round(price, 6), reason) == (1, 1.03, "trail")
 
 
+def test_profit_lock_follows_max_profit():
+    # bar 0: naik 2R (high 1.04) >= pemicu 1R -> SL dikunci di 50% x 0.04 = 1.02 (berlaku bar berikutnya)
+    o, h, l = _arr(1.0, 1.035), _arr(1.04, 1.038), _arr(0.995, 1.01)
+    res = simulate_exit(o, h, l, np.zeros(2), 0, 1, 1.0, 0.98, None, lock_trigger=0.02, lock_fraction=0.5)
+    assert (res[0], round(res[1], 6), res[2]) == (1, 1.02, "lock")
+    # profit maksimum 0.5R < pemicu: SL tidak disentuh, posisi tetap jalan
+    o, h, l = _arr(1.0, 1.005), _arr(1.01, 1.006), _arr(0.995, 0.99)
+    assert simulate_exit(o, h, l, np.zeros(2), 0, 1, 1.0, 0.98, None, lock_trigger=0.02, lock_fraction=0.5) is None
+
+
 def test_no_tp_runs_until_stop():
     o, h, l = _arr(1.0, 1.1, 1.2), _arr(1.1, 1.2, 1.3), _arr(0.99, 1.09, 1.19)
     assert simulate_exit(o, h, l, np.zeros(3), 0, 1, 1.0, 0.98, None) is None
@@ -143,3 +153,14 @@ def test_range_breakout_one_signal_per_day_no_lookahead(settings):
     _add_day_levels(g, p, 2)
     win = ((utc.dt.hour >= 7) & (utc.dt.hour < 11)).to_numpy()
     assert np.allclose(f.loc[win, "lvl_hi"], g.loc[win, "lvl_hi"])
+
+
+def test_ma50_and_candle_confirm_filters(uptrend_waves, settings):
+    h1, h4 = uptrend_waves
+    base = settings.strategy
+    f = compute_features(h1, h4, base)
+    n0 = np.count_nonzero(signal_directions(f, base, settings.session, 0))
+    n1 = np.count_nonzero(signal_directions(f, base.model_copy(update={"ma50_filter": True}), settings.session, 0))
+    n2 = np.count_nonzero(signal_directions(f, base.model_copy(update={"candle_confirm": "any"}), settings.session, 0))
+    n3 = np.count_nonzero(signal_directions(f, base.model_copy(update={"candle_confirm": "engulfing"}), settings.session, 0))
+    assert n0 > 0 and n1 <= n0 and 0 < n2 < n0 and n3 <= n2

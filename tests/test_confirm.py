@@ -87,6 +87,55 @@ def test_price_moved_too_far_blocks(tmp_path, csettings, at_signal, eurusd_meta)
     assert "bergerak" in msgs[-1]
 
 
+def make_setup(price, **kw):
+    from bot.ai.analysis import Setup
+    base = dict(symbol="EURUSD", side="BUY", entry_low=price - 0.0005, entry_high=price + 0.0005,
+                stop_loss=price - 0.0040, take_profit_1=price + 0.0100, take_profit_2=price + 0.0150,
+                confidence="High", reason="BOS naik", valid_minutes=60)
+    base.update(kw)
+    return Setup(**base)
+
+
+def offer(bot, mt5, **kw):
+    from bot.ai.analysis import Analysis
+    bot.offer_setups(Analysis(text="x", setups=[make_setup(mt5.tick("EURUSD").ask, **kw)]))
+
+
+def test_setup_offered_and_executed_at_setup_levels(tmp_path, csettings, at_signal, eurusd_meta):
+    bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
+    offer(bot, mt5)
+    row = signal_row(bot)
+    assert row["source"] == "ai_setup" and row["user_decision"] == "pending" and row["ai_decision"] == "analysis"
+    assert "SETUP BUY EURUSD" in msgs[-1] and "Risiko dasar" in msgs[-1] and "dalam 30 menit" in msgs[-1]
+    click(bot, f"c:{row['id']}:0.005")
+    assert len(mt5.orders) == 1
+    sym, d, vol, tp_dist = mt5.orders[0]
+    assert tp_dist == pytest.approx(0.0100, abs=1e-6)          # TP tepat di TP1 setup, bukan jarak dari zona
+    assert signal_row(bot)["executed"] == 1 and bot.setups_today() == 1
+    assert "pilihan Anda" in msgs[-1]
+
+
+def test_setup_blocked_when_price_leaves_zone(tmp_path, csettings, at_signal, eurusd_meta):
+    from types import SimpleNamespace
+    bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
+    offer(bot, mt5)
+    far = mt5.tick("EURUSD").ask + 0.0030
+    mt5.tick = lambda symbol: SimpleNamespace(bid=far - 0.0001, ask=far)
+    click(bot, f"c:{signal_row(bot)['id']}:0.005")
+    row = signal_row(bot)
+    assert mt5.orders == [] and row["user_decision"] == "blocked" and row["shadow_status"] == "open"
+    assert "di luar zona entry" in msgs[-1]
+
+
+def test_setup_quota_and_low_confidence_not_offered(tmp_path, csettings, at_signal, eurusd_meta):
+    bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
+    offer(bot, mt5, confidence="Low")
+    assert "confidence Low" in msgs[-1] and bot.notifier.buttons == []
+    bot.s = csettings.model_copy(update={"confirm": csettings.confirm.model_copy(update={"max_setups_per_day": 0})})
+    offer(bot, mt5)
+    assert "Kuota 0 setup/hari" in msgs[-1] and bot.notifier.buttons == [] and signal_row(bot) is None
+
+
 def test_ai_reject_has_no_buttons(tmp_path, csettings, at_signal, eurusd_meta):
     bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM("reject", 0), dry_run=False)
     bot.process_symbol("EURUSD")

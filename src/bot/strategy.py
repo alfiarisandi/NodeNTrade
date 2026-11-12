@@ -88,6 +88,24 @@ def _add_entry_indicators(out: pd.DataFrame, p: StrategyCfg) -> None:
         out["cloud_bot"] = pd.concat([span_a, span_b], axis=1).min(axis=1, skipna=False)
 
 
+def candle_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """Pola candle per bar (bool): bull_engulf, bear_engulf, bull_pin, bear_pin, inside.
+    Pin bar = ekor >= 2x body dan >= 60% range bar. Engulfing = body menutup body bar sebelumnya yang berlawanan."""
+    o, h, l, c = df["open"], df["high"], df["low"], df["close"]
+    body = (c - o).abs()
+    rng = (h - l).replace(0, np.nan)
+    upper, lower = h - np.maximum(o, c), np.minimum(o, c) - l
+    po, pc = o.shift(), c.shift()
+    prev_body = (pc - po).abs()
+    return pd.DataFrame({
+        "bull_engulf": (c > o) & (pc < po) & (c >= po) & (o <= pc) & (body > prev_body),
+        "bear_engulf": (c < o) & (pc > po) & (c <= po) & (o >= pc) & (body > prev_body),
+        "bull_pin": (lower >= 2 * body) & (lower >= 0.6 * rng),
+        "bear_pin": (upper >= 2 * body) & (upper >= 0.6 * rng),
+        "inside": (h < h.shift()) & (l > l.shift()),
+    }, index=df.index).fillna(False).astype(bool)
+
+
 def compute_features(entry: pd.DataFrame, trend: pd.DataFrame, p: StrategyCfg,
                      offset_hours: int = 0) -> pd.DataFrame:
     """Indikator timeframe entry + filter tren dari bar timeframe tren yang SUDAH close (tanpa look-ahead).
@@ -244,6 +262,14 @@ def signal_directions(f: pd.DataFrame, p: StrategyCfg, s: SessionCfg, offset_hou
         ok &= d * (f["macd"].to_numpy() - f["macd_sig"].to_numpy()) > 0
     if p.atr_ratio_min > 0:
         ok &= f["atr_ratio"].to_numpy() >= p.atr_ratio_min
+    if p.ma50_filter:
+        ok &= d * (f["close"].to_numpy() - f["ema_slow"].to_numpy()) > 0
+    if p.candle_confirm != "none":
+        fl = candle_flags(f)
+        kinds = {"engulfing": ["engulf"], "pin": ["pin"], "any": ["engulf", "pin"]}[p.candle_confirm]
+        bull = np.logical_or.reduce([fl[f"bull_{k}"].to_numpy() for k in kinds])
+        bear = np.logical_or.reduce([fl[f"bear_{k}"].to_numpy() for k in kinds])
+        ok &= np.where(d == 1, bull, np.where(d == -1, bear, False))
     ok &= session_mask(f["close_time"], offset_hours, s, p.session_hours)
     return np.where(ok, d, 0)
 
@@ -291,17 +317,19 @@ def signal_at(f: pd.DataFrame, i: int, p: StrategyCfg, s: SessionCfg, offset_hou
 def simulate_exit(open_: np.ndarray, high: np.ndarray, low: np.ndarray, spread: np.ndarray,
                   start: int, direction: int, entry: float, sl: float, tp: float | None,
                   be_trigger: float = 0.0, trail_dist: float = 0.0, close: np.ndarray | None = None,
-                  max_bars: int = 0, exit_flag: np.ndarray | None = None) -> tuple[int, float, str] | None:
+                  max_bars: int = 0, exit_flag: np.ndarray | None = None,
+                  lock_trigger: float = 0.0, lock_fraction: float = 0.0) -> tuple[int, float, str] | None:
     """Jalankan posisi bar demi bar mulai index `start`. Harga bar = BID.
 
     Buy keluar di BID, sell keluar di ASK (= bid + spread). Konservatif:
     - jika SL dan TP tersentuh di bar yang sama, dianggap kena SL
     - gap melewati SL/TP dieksekusi di harga open
-    - breakeven & trailing stop baru berlaku mulai bar SETELAH bar pemicunya
+    - breakeven, trailing stop & kunci profit baru berlaku mulai bar SETELAH bar pemicunya
     tp=None berarti tanpa TP. max_bars > 0 = tutup di close bar ke-N (butuh `close`).
+    lock_trigger > 0: setelah profit maksimum >= lock_trigger, SL ikut di lock_fraction x profit maksimum.
     exit_flag[j] True = tutup di close bar j (aturan exit strategi, butuh `close`). Return (index_bar_keluar, harga_keluar, alasan) atau None jika belum keluar.
     """
-    cur_sl, moved = sl, ""
+    cur_sl, moved, mfe = sl, "", 0.0   # mfe = profit maksimum (jarak harga) yang pernah dicapai
     for j in range(start, len(high)):
         if direction == 1:
             o, h, l = open_[j], high[j], low[j]
@@ -318,6 +346,9 @@ def simulate_exit(open_: np.ndarray, high: np.ndarray, low: np.ndarray, spread: 
             if trail_dist and h - trail_dist > cur_sl:
                 cur_sl = h - trail_dist
                 moved = "trail" if cur_sl > entry else moved
+            mfe = max(mfe, h - entry)
+            if lock_trigger and mfe >= lock_trigger and entry + lock_fraction * mfe > cur_sl:
+                cur_sl, moved = entry + lock_fraction * mfe, "lock"
         else:
             sp = spread[j]
             o, h, l = open_[j] + sp, high[j] + sp, low[j] + sp
@@ -334,6 +365,9 @@ def simulate_exit(open_: np.ndarray, high: np.ndarray, low: np.ndarray, spread: 
             if trail_dist and l + trail_dist < cur_sl:
                 cur_sl = l + trail_dist
                 moved = "trail" if cur_sl < entry else moved
+            mfe = max(mfe, entry - l)
+            if lock_trigger and mfe >= lock_trigger and entry - lock_fraction * mfe < cur_sl:
+                cur_sl, moved = entry - lock_fraction * mfe, "lock"
         if close is not None and exit_flag is not None and exit_flag[j]:
             return j, close[j] + (spread[j] if direction == -1 else 0.0), "signal"
         if max_bars and close is not None and j - start + 1 >= max_bars:
