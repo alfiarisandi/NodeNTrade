@@ -213,7 +213,8 @@ def _read_yaml(path: Path) -> dict:
 
 def load_settings(config_path: str | Path | None = None) -> Settings:
     """config_path > env BOT_CONFIG > config/settings.yaml (path relatif terhadap folder project)."""
-    load_dotenv(ROOT / ".env")
+    # override: .env menang atas variabel environment Windows lama (mis. NINEROUTER_API_KEY basi di level User)
+    load_dotenv(ROOT / ".env", override=True)
     chosen = config_path or os.getenv("BOT_CONFIG", "").strip()
     path = (Path(chosen) if Path(chosen).is_absolute() else ROOT / chosen) if chosen else ROOT / "config" / "settings.yaml"
     raw = _read_yaml(path)
