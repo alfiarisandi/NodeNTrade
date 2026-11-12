@@ -223,8 +223,22 @@ class MT5Client:
         return {"filled": True, "position_id": o.position_id, "price": deals[0].price if deals else o.price_open,
                 "volume": o.volume_initial, "sl": o.sl, "tp": o.tp}
 
-    def close_position(self, position, comment: str = "bot exit") -> bool:
-        """Tutup posisi dengan order market berlawanan."""
+    def close_partial(self, position, volume: float, comment: str = "bot partial") -> bool:
+        """Tutup sebagian lot posisi (tiket posisi tetap sama)."""
+        return self.close_position(position, comment, volume)
+
+    def modify_sltp(self, position, sl: float, tp: float) -> bool:
+        """Ubah SL dan TP sekaligus (0 = hapus)."""
+        digits = self.mt5.symbol_info(position.symbol).digits
+        res = self.mt5.order_send({"action": self.mt5.TRADE_ACTION_SLTP, "symbol": position.symbol,
+                                   "position": position.ticket, "sl": round(sl, digits), "tp": round(tp, digits)})
+        ok = res is not None and res.retcode == self.mt5.TRADE_RETCODE_DONE
+        if not ok:
+            log.warning("Gagal ubah SL/TP %s: %s", position.ticket, res.comment if res else self.mt5.last_error())
+        return ok
+
+    def close_position(self, position, comment: str = "bot exit", volume: float | None = None) -> bool:
+        """Tutup posisi (atau sebagian: volume) dengan order market berlawanan."""
         is_buy = position.type == self.mt5.POSITION_TYPE_BUY
         last = None
         for _ in range(3):
@@ -232,7 +246,7 @@ class MT5Client:
             last = self.mt5.order_send({
                 "action": self.mt5.TRADE_ACTION_DEAL,
                 "symbol": position.symbol,
-                "volume": position.volume,
+                "volume": float(volume or position.volume),
                 "type": self.mt5.ORDER_TYPE_SELL if is_buy else self.mt5.ORDER_TYPE_BUY,
                 "position": position.ticket,
                 "price": t.bid if is_buy else t.ask,

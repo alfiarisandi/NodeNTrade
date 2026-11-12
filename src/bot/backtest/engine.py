@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from bot.config import Settings
-from bot.strategy import compute_features, exit_flags, make_signal, signal_directions, simulate_exit
+from bot.strategy import compute_features, exit_flags, make_signal, signal_directions, simulate_exit, simulate_managed
 
 
 @dataclass
@@ -65,9 +65,15 @@ def backtest_symbol(symbol: str, entry_df: pd.DataFrame, trend_df: pd.DataFrame,
         sl = entry - d * sig.sl_distance
         tp = entry + d * sig.tp_distance if sig.tp_distance > 0 else None
         be = p.breakeven_at_r * sig.sl_distance
-        res = simulate_exit(o, h, l, spread, e, d, entry, sl, tp, be, p.trail_atr_mult * sig.atr,
-                            c, p.max_hold_bars, None if exits is None else exits[0 if d == 1 else 1],
-                            p.lock_at_r * sig.sl_distance, p.lock_fraction)
+        first = dict(be_trigger=be, trail_dist=p.trail_atr_mult * sig.atr,
+                     exit_flag=None if exits is None else exits[0 if d == 1 else 1],
+                     lock_trigger=p.lock_at_r * sig.sl_distance, lock_fraction=p.lock_fraction)
+        if p.partial_r > 0:
+            res = simulate_managed(o, h, l, spread, c, e, d, entry, sl, p.partial_r * sig.sl_distance, p.partial_frac,
+                                   entry + d * p.tp2_r * sig.sl_distance if p.tp2_r > 0 else None, spread[e],
+                                   p.post_trail_atr_mult * sig.atr, p.post_swing_bars, p.max_hold_bars, **first)
+        else:
+            res = simulate_exit(o, h, l, spread, e, d, entry, sl, tp, close=c, max_bars=p.max_hold_bars, **first)
         if res is None:
             j = len(f) - 1
             exit_price = c[j] if d == 1 else c[j] + spread[j]

@@ -57,13 +57,14 @@ session:
 
 risk:
   risk_per_trade: 0.005     # 0.5% equity per trade, menekan drawdown (batas keras di kode: maks 1%)
-  max_daily_loss: 0.03      # berhenti buka posisi baru jika rugi hari ini >= 3%
+  max_daily_loss: 0.02      # berhenti buka posisi baru jika rugi hari ini >= 2%
   max_open_positions: 3
   max_currency_exposure: 2  # maks 2 posisi searah pada mata uang yang sama (mis. 2x short USD)
   # Circuit breaker: stop entry baru jika equity turun 15% dari puncak; reset manual (tombol Telegram / --reset-dd).
   # 15% > drawdown terburuk backtest Ichimoku 2019-2026 (13%): terpicu = strategi lebih buruk dari sejarahnya.
   max_drawdown_from_peak: 0.15
   # Cek tilt: setelah 3 rugi beruntun, tombol risiko di atas risk_per_trade (0.5%) disembunyikan (0 = nonaktif)
+  stop_after_losses: 2      # 2 rugi beruntun: entry baru diblok sampai Anda tekan "Lanjut" di Telegram (0 = nonaktif)
   tilt_losing_streak: 3
   # Backtest proteksi profit 2026-11-12 (scripts/variants.py --family ex, EURUSD+XAUUSD): semua kunci profit dini
   # MENURUNKAN total R dibanding keluar lewat sinyal saja (in-sample 31.6R, out-of-sample 22.8R). Padanan aturan
@@ -105,7 +106,24 @@ confirm:
   timeout_minutes: 30           # tidak dijawab = batal (dicatat sebagai shadow trade)
   risk_options: [0.0025, 0.005, 0.01]   # tombol 0.25% / 0.5% / 1% (batas keras maks 1%)
   max_price_move_atr: 0.5       # batal jika harga sudah bergerak > 0.5 ATR dari harga sinyal
-  max_setups_per_day: 3         # setup dari 📊 Analisis yang boleh dieksekusi per hari WIB (spek: maks 2-3 trade/hari)
+  max_setups_per_day: 8         # batas atas setup 📊 yang TERISI per hari WIB (limit yang masih menunggu tidak dihitung)
+
+# Dynamic stop loss + partial TP, HANYA untuk posisi dari setup 📊 Analisis (posisi Ichimoku tidak disentuh).
+# SL hanya boleh mengetat. R = jarak SL awal. Bisa dimatikan per posisi lewat tombol di 📂 Posisi.
+manage:
+  enabled: true
+  be_at_r: 1.0          # profit >= 1R: SL ke breakeven + biaya (komisi + setengah spread)
+  lock_at_r: 1.5        # profit >= 1.5R: SL dikunci di +0.5R
+  lock_r: 0.5
+  partial_frac: 0.5     # tutup 50% lot di target parsial (butuh lot >= 2x lot minimum; kalau tidak, TP1 menutup semua)
+  partial_at_r: 1.0     # target parsial = +1R (0 = di TP1). Backtest xs: parsial di 1R menaikkan win rate ~36% -> ~48-51%
+                        # dengan profit factor hampir sama; parsial di 0.5R / TP dekat menaikkan win rate tapi merugi
+  trail: atr            # sisa posisi setelah TP1: atr | swing | none
+  trail_tf: M15
+  trail_atr_mult: 1.5
+  close_on_choch: true  # setelah TP1, tutup sisa bila struktur M15 berbalik (CHoCH)
+manage_symbols:         # override per pair
+  EURUSD: {trail: swing}
 
 journal_path: data/journal.db
 data_dir: data

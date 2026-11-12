@@ -62,6 +62,13 @@ class StrategyCfg(BaseModel):
     # profit maksimum yang pernah dicapai (0 = nonaktif). Padanan backtest untuk risk.take_profit_usd + trail_lock_fraction.
     lock_at_r: float = 0.0
     lock_fraction: float = 0.0
+    # Partial TP + dynamic SL (backtest): tutup partial_frac di partial_r x R, sisa: SL ke breakeven + spread,
+    # TP di tp2_r x R (0 = tanpa), trailing post_trail_atr_mult x ATR atau low/high post_swing_bars bar terakhir.
+    partial_r: float = 0.0
+    partial_frac: float = 0.5
+    tp2_r: float = 0.0
+    post_trail_atr_mult: float = 0.0
+    post_swing_bars: int = 0
     # Filter konfirmasi tambahan (berlaku untuk entry_type apa pun; default nonaktif)
     ma_filter: bool = False       # buy hanya jika close > EMA(ema_trend) di timeframe entry, sell sebaliknya
     macd_filter: bool = False     # buy hanya jika MACD(12,26,9) > garis sinyal, sell sebaliknya
@@ -98,6 +105,8 @@ class RiskCfg(BaseModel):
     min_lot_max_risk: float = Field(0.0, ge=0, le=0.10)
     # Cek tilt: setelah N rugi beruntun, opsi risiko di atas risk_per_trade disembunyikan (0 = nonaktif)
     tilt_losing_streak: int = Field(3, ge=0)
+    # Setelah N rugi beruntun: entry baru diblok sampai pemilik menekan tombol Lanjut di Telegram (0 = nonaktif)
+    stop_after_losses: int = Field(0, ge=0)
     # Day/swing pendek: tutup posisi bot saat profit floating >= take_profit_usd, atau setelah max_hold_days (0 = nonaktif)
     take_profit_usd: float = Field(0.0, ge=0)
     max_hold_days: float = Field(0.0, ge=0)
@@ -156,7 +165,7 @@ class ConfirmCfg(BaseModel):
     timeout_minutes: int = Field(30, ge=1, le=240)
     risk_options: list[float] = [0.0025, 0.005, 0.01]
     max_price_move_atr: float = 0.5   # batalkan jika harga sudah bergerak > N x ATR dari harga sinyal
-    max_setups_per_day: int = Field(3, ge=0, le=10)   # setup 📊 Analisis yang boleh dieksekusi per hari (WIB)
+    max_setups_per_day: int = Field(8, ge=0, le=10)   # setup 📊 Analisis yang boleh dieksekusi per hari (WIB)
 
     @field_validator("risk_options")
     @classmethod
@@ -165,6 +174,20 @@ class ConfirmCfg(BaseModel):
         if not v or any(not 0 < r <= 0.01 for r in v):
             raise ValueError("risk_options harus di antara 0 dan 0.01 (maks 1%)")
         return sorted(v)
+
+
+class ManageCfg(BaseModel):
+    """Dynamic stop loss + partial TP untuk posisi setup 📊 Analisis (dijalankan bot tiap siklus; SL hanya mengetat)."""
+    enabled: bool = True
+    be_at_r: float = Field(1.0, ge=0)        # profit >= N x R: SL ke breakeven + biaya (0 = nonaktif)
+    lock_at_r: float = Field(1.5, ge=0)      # profit >= N x R: SL dikunci di lock_r x R (0 = nonaktif)
+    lock_r: float = Field(0.5, ge=0)
+    partial_frac: float = Field(0.5, ge=0, lt=1)   # bagian lot yang ditutup di target parsial (0 = TP1 menutup semua)
+    partial_at_r: float = Field(1.0, ge=0)   # target parsial dalam R (0 = di TP1 setup)
+    trail: Literal["atr", "swing", "none"] = "atr"   # trailing sisa posisi setelah TP1
+    trail_tf: Literal["M5", "M15", "M30", "H1"] = "M15"
+    trail_atr_mult: float = Field(1.5, gt=0)
+    close_on_choch: bool = True              # setelah TP1: tutup sisa bila struktur trail_tf berbalik (CHoCH)
 
 
 class Settings(BaseModel):
@@ -181,10 +204,15 @@ class Settings(BaseModel):
     telegram: TelegramCfg = TelegramCfg()
     news: NewsCfg = NewsCfg()
     confirm: ConfirmCfg = ConfirmCfg()
+    manage: ManageCfg = ManageCfg()
+    manage_symbols: dict[str, dict] = Field(default_factory=dict)   # override ManageCfg per simbol
     journal_path: str = "data/journal.db"
     data_dir: str = "data"
     reports_dir: str = "reports"
     poll_seconds: int = 20
+
+    def manage_for(self, name: str) -> ManageCfg:
+        return ManageCfg.model_validate({**self.manage.model_dump(), **self.manage_symbols.get(name, {})})
 
     def broker_symbol(self, name: str) -> str:
         return f"{name}{self.symbol_suffix}"

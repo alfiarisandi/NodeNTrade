@@ -3,18 +3,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from bot.ai.analysis import MIN_RR, Analysis, analyze_market, format_setup, validate_setup
+from bot.ai.analysis import (FULL_RISK_SCORE, MIN_RR, Analysis, analyze_market, format_setup, validate_setup)
 from bot.ai.client import LLM
-from bot.ai.context import build_analysis_context, build_review_context, market_summary
+from bot.ai.context import build_analysis_context, build_review_context, market_structure, market_summary
 from bot.ai.daily_review import daily_report, weekly_report
 from bot.ai.prompts import review_system
 from bot.ai.reviewer import ReviewOutcome, review_signal
 from bot.config import Settings
+from bot.indicators import atr as atr_series
 from bot.journal import Journal
 from bot.mt5_client import MT5Client, MT5Error
 from bot.news import Calendar
@@ -166,6 +168,7 @@ class LiveBot:
             self.calendar.refresh(now)
         self.manage_breakeven()
         self.manage_take_profit_and_hold(now)
+        self.manage_setup_positions(now)
         self.manage_limit_orders(now, acc.equity)
         self.sync_closed_trades()
         self.poll_confirmations()
@@ -278,6 +281,9 @@ class LiveBot:
     def entry_block(self, sym: str, bsym: str, direction: int, equity: float, spread_pts: float) -> str | None:
         if self.error_halt:
             return "kill switch aktif (error berulang)"
+        if self.loss_pause():
+            return (f"{self.s.risk.stop_after_losses} rugi beruntun: evaluasi dulu, lalu tekan ▶️ Lanjut "
+                    f"(atau kirim /lanjut)")
         if self.journal.get_state("paused") == "1":
             return "entry dijeda (tekan ▶️ Resume atau kirim /resume untuk lanjut)"
         if self.daily.halted(equity):
@@ -333,13 +339,16 @@ class LiveBot:
     # ---------- konfirmasi manual lewat Telegram ----------
     def ask_confirmation(self, sid: int, sym: str, sig: Signal, head: str, sl: float, tp_txt: str, price_fmt: str,
                          equity: float, suggested: float, lot: float, ai_text: str,
-                         timeout_minutes: int | None = None, suggest_label: str = "Saran AI") -> bool:
+                         timeout_minutes: int | None = None, suggest_label: str = "Saran AI",
+                         max_risk: float | None = None) -> bool:
         c = self.s.confirm
         timeout_minutes = timeout_minutes or c.timeout_minutes
         rows = []
         streak = self.tilt_streak()
         seen = set()
         for r in self.allowed_risk_options():
+            if max_risk is not None and r > max_risk + 1e-12:   # setup skor 70-79: tanpa opsi risiko besar
+                continue
             opt_lot = self.lot_for(sym, equity, r, sig.sl_distance)
             if opt_lot > 0 and opt_lot not in seen:   # akun kecil: beberapa opsi bisa jadi lot minimum yang sama
                 seen.add(opt_lot)
@@ -385,10 +394,15 @@ class LiveBot:
                 self.notifier.answer(cq["id"], "Tidak diizinkan")
                 log.warning("Callback dari chat tak dikenal %s diabaikan", chat)
                 continue
+            if cq.get("data") == "go:1":
+                self.resume_after_losses()
+                self.notifier.answer(cq["id"], "Entry dilanjutkan")
+                self.notifier.clear_buttons((cq.get("message") or {}).get("message_id"))
+                continue
             if cq.get("data") == "dd:reset":
                 self.reset_drawdown(cq)
                 continue
-            if str(cq.get("data", "")).split(":")[0] in ("pc", "pcy", "pcn", "be"):
+            if str(cq.get("data", "")).split(":")[0] in ("pc", "pcy", "pcn", "be", "ds"):
                 self.position_action(cq)
                 continue
             parts = str(cq.get("data", "")).split(":")
@@ -596,6 +610,7 @@ class LiveBot:
             cmd = "menu"
         {"status": self.cmd_status, "posisi": self.cmd_positions, "pnl": self.cmd_pnl, "sinyal": self.cmd_signals,
          "pause": self.cmd_pause, "resume": self.cmd_resume, "analisis": self.cmd_analysis,
+         "lanjut": self.resume_after_losses,
          "menu": self.cmd_menu, "start": self.cmd_menu}.get(cmd, self.cmd_help)()
 
     def menu_rows(self) -> list[list[str]]:
@@ -655,7 +670,9 @@ class LiveBot:
             self.notifier.send_buttons(
                 f"{'BUY' if pos.type == 0 else 'SELL'} {pos.symbol} {pos.volume} lot #{pos.ticket}\n"
                 f"Open {pos.price_open} | SL {pos.sl or '-'}\nProfit {net:+.2f} | umur {age} | tren {trend}",
-                [[("❌ Tutup sekarang", f"pc:{pos.ticket}"), ("🔒 SL ke breakeven", f"be:{pos.ticket}")]])
+                [[("❌ Tutup sekarang", f"pc:{pos.ticket}"), ("🔒 SL ke breakeven", f"be:{pos.ticket}")]]
+                + ([[(f"🤖 Dynamic SL: {'OFF, nyalakan' if self.manage_state(pos.ticket).get('off') else 'ON, matikan'}",
+                      f"ds:{pos.ticket}")]] if self.setup_of(pos.ticket) else []))
 
     def cmd_pnl(self) -> None:
         now = datetime.now(timezone.utc)
@@ -687,6 +704,19 @@ class LiveBot:
             src = "📊 setup " if r["source"] == "ai_setup" else ""
             lines.append(f"{when} {src}{'BUY' if r['direction'] == 1 else 'SELL'} {r['symbol']}: {status}{ai}")
         self.notify("🔔 5 sinyal terakhir (WIB)\n" + "\n".join(lines))
+
+    def loss_pause(self) -> bool:
+        """True jika N trade nyata terakhir semuanya rugi dan pemilik belum menekan Lanjut sejak itu."""
+        n = self.s.risk.stop_after_losses
+        rows = self.journal.recent_closed(n) if n else []
+        if not n or len(rows) < n or any((r["profit"] or 0) >= 0 for r in rows):
+            return False
+        return self.journal.get_state("loss_ack") != rows[0]["close_time"]
+
+    def resume_after_losses(self) -> None:
+        rows = self.journal.recent_closed(1)
+        self.journal.set_state("loss_ack", rows[0]["close_time"] if rows else "")
+        self.notify("▶️ Entry baru dan setup diizinkan lagi. Jeda aktif kembali bila rugi beruntun terulang.")
 
     def cmd_pause(self) -> None:
         self.journal.set_state("paused", "1")
@@ -751,9 +781,11 @@ class LiveBot:
         r = self.s.risk
         rules = {"risk_per_trade_options_%": [o * 100 for o in self.s.confirm.risk_options],
                  "max_daily_loss_%": r.max_daily_loss * 100, "today_pnl_%": round(100 * self.daily.pnl_pct(acc.equity), 2),
-                 "max_open_positions": r.max_open_positions, "min_reward_risk": 2,
+                 "max_open_positions": r.max_open_positions, "min_reward_risk": MIN_RR,
+                 "max_setups_per_day": self.s.confirm.max_setups_per_day, "setups_taken_today": self.setups_today(),
+                 "paused_after_consecutive_losses": self.loss_pause(),
                  "execution": "after owner confirms: price not yet at zone = LIMIT order at zone middle, "
-                              "waits valid_minutes; price at/through zone = market order if RR still >= 2"}
+                              "waits valid_minutes; price at/through zone = market order if RR still >= 1.5"}
         ctx = build_analysis_context(per_symbol, self.s.strategy, self.meta, spreads, now, self.offset,
                                      self.calendar if self.calendar and self.calendar.available else None,
                                      {"equity": round(acc.equity, 2), "balance": round(acc.balance, 2),
@@ -768,7 +800,9 @@ class LiveBot:
                 continue
             bars = self.mt5.rates(self.s.broker_symbol(st.symbol), "H1", 100)
             atr_h1 = float((bars["high"] - bars["low"]).tail(14).mean()) if len(bars) else 0.0
-            out.append((st, validate_setup(st, atr_h1), atr_h1))
+            meta, t = self.meta[st.symbol], self.mt5.tick(self.s.broker_symbol(st.symbol))
+            cost = (t.ask - t.bid) + self.s.backtest.commission_per_lot * meta["tick_size"] / meta["tick_value"]
+            out.append((st, validate_setup(st, atr_h1, cost), atr_h1))
         return out
 
     def setups_today(self) -> int:
@@ -822,9 +856,10 @@ class LiveBot:
             f" (TP2 {st.take_profit_2:{price_fmt}} dikelola manual)" if st.take_profit_2 is not None else "")
         head = f"SETUP {st.side} {sym} | zona {st.entry_low:{price_fmt}}-{st.entry_high:{price_fmt}}"
         ok = self.ask_confirmation(sid, sym, sig, head, st.stop_loss, tp_txt, price_fmt, acc.equity, suggested, lot,
-                                   text + "\nKlik: harga belum di zona = pasang order LIMIT di tengah zona; sudah lewat zona = market jika RR >= 2.",
+                                   text + "\nKlik: harga belum di zona = pasang order LIMIT di tengah zona; sudah lewat zona = market jika RR masih cukup.",
                                    timeout_minutes=min(self.s.confirm.timeout_minutes, st.valid_minutes),
-                                   suggest_label="Risiko dasar")
+                                   suggest_label="Risiko dasar",
+                                   max_risk=None if st.score_total >= FULL_RISK_SCORE else suggested)
         if not ok:
             self.journal.update_signal(sid, skip_reason="pesan konfirmasi Telegram gagal terkirim")
             self.journal.open_shadow(sid, st.entry_mid, st.stop_loss, st.take_profit_1)
@@ -867,6 +902,12 @@ class LiveBot:
                 self.notify(f"🖐️ {pos.symbol} #{pos.ticket} ditutup manual dari Telegram (profit {net:+.2f})")
             else:
                 self.notifier.answer(cq["id"], "Gagal menutup, cek log")
+        elif kind == "ds":
+            st = self.manage_state(pos.ticket)
+            st["off"] = not st.get("off")
+            self.save_manage_state(pos.ticket, st)
+            self.notifier.answer(cq["id"], "Dynamic SL dimatikan" if st["off"] else "Dynamic SL dinyalakan")
+            self.notify(f"🤖 {pos.symbol} #{pos.ticket}: dynamic SL {'DIMATIKAN, posisi dikelola manual' if st['off'] else 'AKTIF lagi'}")
         elif kind == "be":
             d = 1 if pos.type == 0 else -1
             t = self.mt5.tick(pos.symbol)
@@ -962,6 +1003,105 @@ class LiveBot:
             if hit and self.mt5.close_position(pos, "bot exit sinyal"):
                 self.notify(f"🔁 Exit sinyal {sym} #{pos.ticket}: aturan exit {self.s.strategy.entry_type} terpenuhi")
 
+    # ---------- dynamic SL & partial TP untuk posisi setup 📊 (source = ai_setup) ----------
+    def manage_state(self, ticket: int) -> dict:
+        return json.loads(self.journal.get_state(f"mg:{ticket}") or "{}")
+
+    def save_manage_state(self, ticket: int, st: dict) -> None:
+        self.journal.set_state(f"mg:{ticket}", json.dumps(st))
+
+    def setup_of(self, ticket: int) -> tuple | None:
+        """(baris trade, dict setup) jika posisi ini berasal dari setup 📊 Analisis, selain itu None."""
+        row = next((r for r in self.journal.open_trades() if r["ticket"] == ticket), None)
+        sig = self.journal.get_signal(row["signal_id"]) if row is not None and row["signal_id"] else None
+        if sig is None or sig["source"] != "ai_setup" or not sig["setup"]:
+            return None
+        return row, json.loads(sig["setup"])
+
+    def manage_setup_positions(self, now: datetime) -> None:
+        """Tahap dynamic SL: breakeven + biaya -> kunci profit -> partial di TP1 -> trailing sisa posisi.
+        Satu aksi per posisi per siklus (data posisi dibaca ulang dari MT5 di siklus berikutnya)."""
+        for pos in self.mt5.positions(self.s.magic):
+            found = self.setup_of(pos.ticket)
+            if found:
+                self.manage_setup_position(pos, found[0], found[1], now)
+
+    def trail_frame(self, bsym: str, cfg) -> pd.DataFrame:
+        return self.mt5.rates(bsym, cfg.trail_tf, 200)
+
+    def manage_setup_position(self, pos, row, setup: dict, now: datetime) -> None:
+        sym = row["symbol"]
+        cfg, st = self.s.manage_for(sym), self.manage_state(pos.ticket)
+        r_dist = abs(row["entry"] - row["sl"]) if row["sl"] else 0.0   # R = jarak SL awal (tidak pernah berubah)
+        if not cfg.enabled or st.get("off") or r_dist <= 0:
+            return
+        meta, d = self.meta[sym], (1 if pos.type == 0 else -1)
+        f = f".{meta['digits']}f"
+        t = self.mt5.tick(pos.symbol)
+        px = t.bid if d == 1 else t.ask            # harga keluar posisi ini
+        entry, tp1, tp2 = pos.price_open, setup["take_profit_1"], setup.get("take_profit_2")
+        r_now = d * (px - entry) / r_dist
+        # Biaya dalam satuan harga: komisi round-turn per lot + setengah spread sebagai cadangan slippage
+        cost = self.s.backtest.commission_per_lot * meta["tick_size"] / meta["tick_value"] + (t.ask - t.bid) / 2
+        splittable = cfg.partial_frac > 0 and pos.volume >= 2 * meta["volume_min"] - 1e-9
+
+        # TP server pindah ke TP2: bagian pertama ditutup bot di TP1, sisanya dibiarkan jalan
+        if splittable and not st.get("partial") and not st.get("tp_moved"):
+            new_tp = tp2 if tp2 and d * (tp2 - tp1) > 0 else 0.0
+            if self.mt5.modify_sltp(pos, pos.sl, new_tp):
+                st["tp_moved"] = True
+                self.save_manage_state(pos.ticket, st)
+            return
+        part_px = entry + d * cfg.partial_at_r * r_dist if cfg.partial_at_r else tp1
+        part_px = part_px if d * (tp1 - part_px) > 0 else tp1          # tidak pernah melewati TP1
+        if st.get("tp_moved") and not st.get("partial") and d * (px - part_px) >= 0:
+            step = meta["volume_step"]
+            vol = round(max(math.floor(pos.volume * cfg.partial_frac / step + 1e-9) * step, meta["volume_min"]), 8)
+            if self.mt5.close_partial(pos, vol, "bot partial TP1"):
+                brk = market_structure(self.trail_frame(pos.symbol, cfg), meta["digits"]).get("last_break") or {}
+                st.update(partial=True, brk=brk.get("time"))
+                st.setdefault("events", []).append([now.isoformat(timespec="seconds"), "partial", round(part_px, meta["digits"])])
+                self.save_manage_state(pos.ticket, st)
+                self.notify(f"🎯 {sym} #{pos.ticket}: target parsial {part_px:{f}} ({r_now:+.1f}R) tercapai, {vol:g} lot ditutup. Sisa "
+                            f"{pos.volume - vol:g} lot dibiarkan jalan dengan SL terkunci"
+                            + (f", target TP2 {tp2:{f}}" if tp2 else ""))
+            return
+
+        cands = []   # (SL baru, label); dipilih yang paling menguntungkan posisi
+        if st.get("partial") or (cfg.be_at_r and r_now >= cfg.be_at_r):
+            cands.append((entry + d * cost, "breakeven + biaya"))
+        if cfg.lock_at_r and r_now >= cfg.lock_at_r:
+            cands.append((entry + d * cfg.lock_r * r_dist, f"kunci {cfg.lock_r:g}R"))
+        if st.get("partial") and cfg.trail != "none":
+            df = self.trail_frame(pos.symbol, cfg)
+            if len(df) >= 30:
+                a = float(atr_series(df["high"], df["low"], df["close"], 14).iloc[-1])
+                ms = market_structure(df, meta["digits"])
+                brk = ms.get("last_break") or {}
+                against = brk.get("direction") == ("down" if d == 1 else "up")
+                if cfg.close_on_choch and brk.get("type") == "CHoCH" and against and brk.get("time") != st.get("brk"):
+                    if self.mt5.close_position(pos, "bot exit CHoCH"):
+                        self.notify(f"🔁 {sym} #{pos.ticket}: struktur {cfg.trail_tf} berbalik (CHoCH {brk.get('level')}), "
+                                    f"sisa posisi ditutup di {r_now:+.1f}R")
+                    return
+                if cfg.trail == "atr":
+                    cands.append((px - d * cfg.trail_atr_mult * a, f"trailing {cfg.trail_atr_mult:g} ATR {cfg.trail_tf}"))
+                else:
+                    pivot = ms.get("last_pivot_low" if d == 1 else "last_pivot_high")
+                    if pivot is not None:
+                        cands.append((pivot - d * 0.1 * a, f"trailing swing {cfg.trail_tf}"))
+        if not cands:
+            return
+        new_sl, label = max(cands, key=lambda c: d * c[0])
+        gap = (meta.get("stops_level", 0) + 2) * meta["point"]
+        # Invarian: SL hanya boleh mendekat ke harga (minimal 0.1R lebih baik, hindari modify tiap siklus)
+        better = not pos.sl or d * (new_sl - pos.sl) >= 0.1 * r_dist
+        if better and d * (px - new_sl) > gap and self.mt5.modify_sl(pos, new_sl):
+            st.setdefault("events", []).append([now.isoformat(timespec="seconds"), label, round(new_sl, meta["digits"])])
+            st["stage"] = label
+            self.save_manage_state(pos.ticket, st)
+            self.notify(f"🔒 {sym} #{pos.ticket}: SL → {new_sl:{f}} ({label}), profit sekarang {r_now:+.1f}R")
+
     def manage_breakeven(self) -> None:
         be_r = self.s.strategy.breakeven_at_r
         if not be_r:
@@ -1040,6 +1180,13 @@ class LiveBot:
             r_txt = f"{tr['r_multiple']:+.2f}R" if tr["r_multiple"] is not None else ""
             self.notify(f"{icon} CLOSE {tr['symbol']} #{tr['ticket']} @ {tr['close_price']}\n"
                         f"Profit {tr['profit']:+.2f} ({r_txt})")
+            if self.loss_pause() and self.journal.get_state("loss_prompt") != tr["close_time"]:
+                self.journal.set_state("loss_prompt", tr["close_time"])
+                self.notifier.send_buttons(
+                    f"⛔ {self.s.risk.stop_after_losses} rugi beruntun. Entry baru dan setup dihentikan dulu.\n"
+                    "Evaluasi: apakah entry terlalu cepat, SL terlalu dekat, atau melawan tren? "
+                    "Tekan tombol di bawah kalau sudah siap lanjut.",
+                    [[("▶️ Lanjut (sudah evaluasi)", "go:1")]])
 
     # ---------- shadow trade ----------
     def resolve_shadows(self) -> None:

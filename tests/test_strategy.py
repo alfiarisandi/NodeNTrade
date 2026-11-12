@@ -164,3 +164,23 @@ def test_ma50_and_candle_confirm_filters(uptrend_waves, settings):
     n2 = np.count_nonzero(signal_directions(f, base.model_copy(update={"candle_confirm": "any"}), settings.session, 0))
     n3 = np.count_nonzero(signal_directions(f, base.model_copy(update={"candle_confirm": "engulfing"}), settings.session, 0))
     assert n0 > 0 and n1 <= n0 and 0 < n2 < n0 and n3 <= n2
+
+
+def test_partial_tp_then_breakeven_and_trailing():
+    from bot.strategy import simulate_managed
+    # buy 1.00, SL 0.98 (R = 0.02). bar0: sentuh TP1 1.02 -> 50% keluar. bar1: turun ke entry -> sisa keluar di BE.
+    o, h, l, c = _arr(1.0, 1.015, 1.0), _arr(1.021, 1.016, 1.0), _arr(0.995, 0.999, 0.99), _arr(1.02, 1.0, 0.99)
+    j, price, why = simulate_managed(o, h, l, np.zeros(3), c, 0, 1, 1.0, 0.98, 0.02, 0.5)
+    assert (j, round(price, 6), why) == (1, 1.01, "partial+be")        # +0.5R total, tetap menang
+    # sisa posisi lari ke TP2 1.06: 0.5 x 1.02 + 0.5 x 1.06
+    o, h, l, c = _arr(1.0, 1.03, 1.05), _arr(1.021, 1.05, 1.07), _arr(0.995, 1.025, 1.04), _arr(1.02, 1.05, 1.06)
+    j, price, why = simulate_managed(o, h, l, np.zeros(3), c, 0, 1, 1.0, 0.98, 0.02, 0.5, tp2=1.06)
+    assert (j, round(price, 6), why) == (2, 1.04, "partial+tp")
+    # SL kena sebelum TP1: hasil sama dengan simulate_exit biasa
+    o, h, l, c = _arr(1.0), _arr(1.01), _arr(0.97), _arr(0.98)
+    assert simulate_managed(o, h, l, np.zeros(1), c, 0, 1, 1.0, 0.98, 0.02, 0.5) == (0, 0.98, "sl")
+    # trailing swing 2 bar setelah TP1: SL naik ke low terendah 2 bar terakhir
+    o, h, l, c = _arr(1.0, 1.03, 1.04, 1.045), _arr(1.021, 1.045, 1.05, 1.046), _arr(0.995, 1.028, 1.035, 1.02), \
+        _arr(1.02, 1.04, 1.045, 1.03)
+    j, price, why = simulate_managed(o, h, l, np.zeros(4), c, 0, 1, 1.0, 0.98, 0.02, 0.5, post_swing_bars=2)
+    assert (j, why) == (3, "partial+trail") and round(price, 6) == round(0.5 * 1.02 + 0.5 * 1.028, 6)

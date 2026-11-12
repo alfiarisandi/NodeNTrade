@@ -16,6 +16,7 @@ class FakeMT5:
         self.open_positions, self.orders, self.closed_positions = [], [], []
         self.closed = {}
         self.limits, self.pending, self.outcomes = [], [], {}
+        self.sl_moves, self.partials = [], []
 
     def account(self):
         return SimpleNamespace(login=1, server="Demo", equity=10_000.0, balance=10_000.0, currency="USD")
@@ -63,6 +64,17 @@ class FakeMT5:
         return True
 
     def modify_sl(self, pos, sl):
+        self.sl_moves.append((pos.ticket, sl))
+        pos.sl = sl
+        return True
+
+    def modify_sltp(self, pos, sl, tp):
+        pos.sl, pos.tp = sl, tp
+        return True
+
+    def close_partial(self, pos, volume, comment=""):
+        self.partials.append((pos.ticket, volume))
+        pos.volume = round(pos.volume - volume, 8)
         return True
 
     def closed_position_result(self, ticket):

@@ -11,7 +11,8 @@ from conftest import resample_h4
 
 def setup(**kw):
     base = dict(symbol="xauusd", side="BUY", entry_low=2000.0, entry_high=2002.0, stop_loss=1995.0,
-                take_profit_1=2013.0, take_profit_2=2020.0, confidence="High", reason="r", wait_for="w", invalid_if="i")
+                take_profit_1=2013.0, take_profit_2=2020.0, confidence="High", reason="r", wait_for="w", invalid_if="i",
+                score=dict(trend=18, structure=18, key_level=12, price_action=16, momentum=12, rr=10))
     base.update(kw)
     return Setup(**base)
 
@@ -31,7 +32,7 @@ def test_parse_tolerates_fences_and_normalizes():
 def test_validate_setup_hard_limits():
     atr = 4.0
     assert validate_setup(setup(), atr) is None                                   # SL 6 = 1.5 ATR, RR 2.0
-    assert "RR" in validate_setup(setup(take_profit_1=2010.0), atr)               # RR 1.5
+    assert "RR" in validate_setup(setup(take_profit_1=2008.0), atr)               # RR 1.17
     assert "SL di sisi" in validate_setup(setup(stop_loss=2005.0), atr)
     assert "TP1 di sisi" in validate_setup(setup(take_profit_1=1990.0), atr)
     assert "jarak SL" in validate_setup(setup(stop_loss=1980.0, take_profit_1=2050.0), atr)   # 5.25 ATR
@@ -69,3 +70,15 @@ def test_analysis_context_structure(uptrend_waves, settings, eurusd_meta):
     assert ctx["session"]["label"] == "London" and ctx["high_impact_events_next_24h"] == "calendar unavailable"
     assert ctx["owner_rules"] == {"min_reward_risk": 2} and sym["price_now"] == {"bid": 1.12346, "ask": 1.1236}
     assert resample_h4
+
+
+def test_score_and_cost_limits():
+    atr = 4.0
+    low = setup(score=dict(trend=20, structure=20, key_level=15, price_action=0, momentum=5, rr=5))
+    assert low.score_total == 65 and "skor 65/100 < 70" in validate_setup(low, atr)
+    capped = setup(score=dict(trend=99, structure=20, key_level=15, price_action=20, momentum=15, rr=10, bonus=50))
+    assert capped.score_total == 100                                   # tiap komponen dibatasi bobotnya
+    assert "skor 0/100" in validate_setup(setup(score={}), atr)        # tanpa skor = tidak ditawarkan
+    assert validate_setup(setup(), atr, cost=0.8) is None              # biaya 0.8 dari SL 6 = 13%
+    assert "SL terlalu sempit" in validate_setup(setup(), atr, cost=1.0)   # 17% > 15%
+    assert "skor 86/100" in format_setup(setup(), 2)

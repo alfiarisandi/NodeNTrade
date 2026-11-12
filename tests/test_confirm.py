@@ -91,7 +91,8 @@ def make_setup(price, **kw):
     from bot.ai.analysis import Setup
     base = dict(symbol="EURUSD", side="BUY", entry_low=price - 0.0005, entry_high=price + 0.0005,
                 stop_loss=price - 0.0040, take_profit_1=price + 0.0100, take_profit_2=price + 0.0150,
-                confidence="High", reason="BOS naik", valid_minutes=60)
+                confidence="High", reason="BOS naik", valid_minutes=60,
+                score=dict(trend=18, structure=18, key_level=12, price_action=16, momentum=12, rr=10))
     base.update(kw)
     return Setup(**base)
 
@@ -140,7 +141,7 @@ def test_setup_limit_when_zone_not_reached_then_fill_and_expiry(tmp_path, csetti
     assert mt5.orders == [] and len(mt5.limits) == 1 and row["user_decision"] == "limit"
     _, d, vol, price, sl, tp = mt5.limits[0]
     assert d == 1 and price == pytest.approx(base) and sl == pytest.approx(base - 0.0040) and tp == pytest.approx(base + 0.0100)
-    assert "LIMIT BUY" in msgs[-1] and bot.setups_today() == 1
+    assert "LIMIT BUY" in msgs[-1] and bot.setups_today() == 0   # limit yang masih menunggu tidak memakai kuota
     assert bot.open_list() == [("EURUSD", 1)]   # limit menunggu ikut dihitung untuk batas posisi/eksposur
     # terisi: tercatat sebagai trade
     ticket = row["limit_ticket"]

@@ -318,8 +318,10 @@ def simulate_exit(open_: np.ndarray, high: np.ndarray, low: np.ndarray, spread: 
                   start: int, direction: int, entry: float, sl: float, tp: float | None,
                   be_trigger: float = 0.0, trail_dist: float = 0.0, close: np.ndarray | None = None,
                   max_bars: int = 0, exit_flag: np.ndarray | None = None,
-                  lock_trigger: float = 0.0, lock_fraction: float = 0.0) -> tuple[int, float, str] | None:
+                  lock_trigger: float = 0.0, lock_fraction: float = 0.0,
+                  swing_bars: int = 0) -> tuple[int, float, str] | None:
     """Jalankan posisi bar demi bar mulai index `start`. Harga bar = BID.
+    swing_bars > 0: SL mengikuti low terendah (buy) / high tertinggi (sell) dari N bar terakhir, hanya mengetat.
 
     Buy keluar di BID, sell keluar di ASK (= bid + spread). Konservatif:
     - jika SL dan TP tersentuh di bar yang sama, dianggap kena SL
@@ -349,6 +351,8 @@ def simulate_exit(open_: np.ndarray, high: np.ndarray, low: np.ndarray, spread: 
             mfe = max(mfe, h - entry)
             if lock_trigger and mfe >= lock_trigger and entry + lock_fraction * mfe > cur_sl:
                 cur_sl, moved = entry + lock_fraction * mfe, "lock"
+            if swing_bars and j - start + 1 >= swing_bars and low[j - swing_bars + 1:j + 1].min() > cur_sl:
+                cur_sl, moved = low[j - swing_bars + 1:j + 1].min(), "trail"
         else:
             sp = spread[j]
             o, h, l = open_[j] + sp, high[j] + sp, low[j] + sp
@@ -368,8 +372,37 @@ def simulate_exit(open_: np.ndarray, high: np.ndarray, low: np.ndarray, spread: 
             mfe = max(mfe, entry - l)
             if lock_trigger and mfe >= lock_trigger and entry - lock_fraction * mfe < cur_sl:
                 cur_sl, moved = entry - lock_fraction * mfe, "lock"
+            if swing_bars and j - start + 1 >= swing_bars:
+                sw = (high[j - swing_bars + 1:j + 1] + spread[j - swing_bars + 1:j + 1]).max()
+                if sw < cur_sl:
+                    cur_sl, moved = sw, "trail"
         if close is not None and exit_flag is not None and exit_flag[j]:
             return j, close[j] + (spread[j] if direction == -1 else 0.0), "signal"
         if max_bars and close is not None and j - start + 1 >= max_bars:
             return j, close[j] + (spread[j] if direction == -1 else 0.0), "time"
     return None
+
+
+def simulate_managed(open_: np.ndarray, high: np.ndarray, low: np.ndarray, spread: np.ndarray, close: np.ndarray,
+                     start: int, direction: int, entry: float, sl: float, partial_at: float, partial_frac: float,
+                     tp2: float | None = None, be_buffer: float = 0.0, post_trail: float = 0.0,
+                     post_swing_bars: int = 0, max_bars: int = 0, **first) -> tuple[int, float, str] | None:
+    """Partial TP + dynamic SL: tutup partial_frac di entry +/- partial_at (TP1); sisa posisi lanjut dengan SL di
+    entry +/- be_buffer (breakeven + biaya), TP di tp2 (None = tanpa), trailing post_trail / post_swing_bars.
+    Harga keluar yang dikembalikan = rata-rata tertimbang kedua bagian, jadi R trade tetap d*(harga-entry)/SL.
+    `first` = argumen simulate_exit untuk fase sebelum TP1 (be_trigger, lock_trigger, ...)."""
+    d = direction
+    a = simulate_exit(open_, high, low, spread, start, d, entry, sl, entry + d * partial_at, close=close,
+                      max_bars=max_bars, **first)
+    if a is None or a[2] != "tp":
+        return a
+    j1, p1, _ = a
+    left = max_bars - (j1 - start + 1) if max_bars else 0
+    if j1 + 1 >= len(high) or (max_bars and left <= 0):
+        j2, p2, why = j1, close[j1] + (spread[j1] if d == -1 else 0.0), "time"
+    else:
+        b = simulate_exit(open_, high, low, spread, j1 + 1, d, entry, entry + d * be_buffer, tp2,
+                          trail_dist=post_trail, close=close, max_bars=left, swing_bars=post_swing_bars)
+        j2, p2, why = b if b is not None else (len(high) - 1, close[-1] + (spread[-1] if d == -1 else 0.0), "eod")
+        why = "be" if why == "sl" else why
+    return j2, partial_frac * p1 + (1 - partial_frac) * p2, f"partial+{why}"

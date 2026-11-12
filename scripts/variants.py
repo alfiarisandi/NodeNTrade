@@ -186,8 +186,38 @@ DD_VARIANTS: dict[str, dict] = {
     "dd_pullback_2R_engulf": {**DD_PB, "candle_confirm": "engulfing"},
 }
 
+# Studi kebijakan exit intraday (dynamic SL / partial TP) di atas entri day-trade yang sama (family dd).
+# Tujuan: win rate tertinggi yang masih untung setelah biaya. tpX = TP penuh di X R (pembanding win rate tinggi).
+# HASIL 2026-11-12 (EURUSD+XAUUSD, entri pdh & pullback): tidak ada kebijakan yang lolos PF > 1.2 di kedua periode
+# (entrinya sendiri rugi), jadi yang dibaca adalah efek relatif exit:
+# - TP makin dekat = win rate naik tapi makin rugi: tp0.2R win 74-81% dengan PF 0.43-0.65; win rate 90% tidak tercapai.
+# - Parsial 50% di 1R + sisa jalan (BE, TP 3R / trailing swing): win rate 36% -> 48-51%, PF hampir sama dengan tp2R.
+# - Parsial di 0.5R: win rate 60-64% tapi PF turun (0.75-0.96). BE di 0.5R: buruk. BE di 1R: PF netral.
+# Dipakai live (config manage): parsial 50% di 1R, BE+biaya di 1R, kunci 0.5R di 1.5R, trailing swing/ATR.
+PART = {"tp_r": 0, "tp_atr_mult": 0, "partial_r": 1.0, "partial_frac": 0.5}
+XS_POLICIES: dict[str, dict] = {
+    "tp2R": {},
+    "tp1R": {"tp_r": 1.0},
+    "tp0.5R": {"tp_r": 0.5},
+    "tp0.3R": {"tp_r": 0.3},
+    "tp0.2R": {"tp_r": 0.2},
+    "tp2R_be1R": {"breakeven_at_r": 1.0},
+    "tp2R_be0.5R": {"breakeven_at_r": 0.5},
+    "tp2R_be1R_lock1.5R": {"breakeven_at_r": 1.0, "lock_at_r": 1.5, "lock_fraction": 0.33},
+    "part1R_be_tp2R": {**PART, "tp2_r": 2.0},
+    "part1R_be_tp3R": {**PART, "tp2_r": 3.0},
+    "part1R_trailATR1": {**PART, "post_trail_atr_mult": 1.0},
+    "part1R_trailATR1.5": {**PART, "post_trail_atr_mult": 1.5},
+    "part1R_swing5": {**PART, "post_swing_bars": 5},
+    "part0.5R_be_tp2R": {**PART, "partial_r": 0.5, "tp2_r": 2.0},
+    "part0.5R_trailATR1": {**PART, "partial_r": 0.5, "post_trail_atr_mult": 1.0},
+}
+XS_VARIANTS: dict[str, dict] = {f"{b}|{k}": {**base, **pol}
+                                for b, base in (("pdh", DD_PDH), ("pullback", {**DD_PB, "ma50_filter": True}))
+                                for k, pol in XS_POLICIES.items()}
+
 VARIANTS = {**TREND_VARIANTS, **MR_VARIANTS, **OS_VARIANTS, **CF_VARIANTS, **DT_VARIANTS, **SM_VARIANTS,
-            **DY_VARIANTS, **EX_VARIANTS, **DD_VARIANTS}
+            **DY_VARIANTS, **EX_VARIANTS, **DD_VARIANTS, **XS_VARIANTS}
 
 
 def evaluate(s, names, data_dir, start, end) -> tuple[dict, dict]:
@@ -236,7 +266,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="2024-01-01")
     ap.add_argument("--from", dest="start", default="2019-01-01")
-    ap.add_argument("--family", choices=["tf", "mr", "os", "cf", "dt", "sm", "dy", "ex", "dd"], default="tf",
+    ap.add_argument("--family", choices=["tf", "mr", "os", "cf", "dt", "sm", "dy", "ex", "dd", "xs"], default="tf",
                     help="tf = trend following, mr = mean reversion, os = strategi open source, "
                          "cf = Ichimoku H4 + filter MA/MACD/ATR, dt = day trade akun kecil, "
                          "sm = Ichimoku H4 + MA200 akun kecil, ex = proteksi profit di setelan live, "
@@ -256,7 +286,7 @@ def main() -> None:
     elif day_trade:
         names = args.symbols or DT_SYMBOLS
         base = dt_settings(base, names)
-    elif args.family == "dd" or args.validate in DD_VARIANTS:
+    elif args.family in ("dd", "xs") or args.validate in DD_VARIANTS or args.validate in XS_VARIANTS:
         names = args.symbols or DD_SYMBOLS
         base = base.model_copy(update={
             "symbols": [SymbolCfg(name=n, max_spread_points=50 if n == "XAUUSD" else 25) for n in names],
@@ -277,7 +307,7 @@ def main() -> None:
     else:
         chosen = {"tf": TREND_VARIANTS, "mr": MR_VARIANTS, "os": OS_VARIANTS, "cf": CF_VARIANTS,
                   "dt": DT_VARIANTS, "sm": SM_VARIANTS, "dy": DY_VARIANTS, "ex": EX_VARIANTS,
-                  "dd": DD_VARIANTS}[args.family]
+                  "dd": DD_VARIANTS, "xs": XS_VARIANTS}[args.family]
         start, end, label = pd.Timestamp(args.start), split, "IN-SAMPLE"
 
     rows, pairs = {}, {}

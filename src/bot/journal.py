@@ -114,9 +114,9 @@ class Journal:
         return cur.lastrowid
 
     def setups_executed_since(self, iso_ts: str) -> int:
-        """Jumlah setup 📊 Analisis yang dieksekusi (atau limit-nya masih menunggu) sejak iso_ts (kuota harian)."""
+        """Jumlah setup 📊 Analisis yang benar-benar terisi sejak iso_ts (kuota harian; limit menunggu tidak dihitung)."""
         return self.db.execute("SELECT COUNT(*) FROM signals WHERE source='ai_setup' AND created_at >= ?"
-                               " AND (executed=1 OR user_decision='limit')",
+                               " AND executed=1",
                                (iso_ts,)).fetchone()[0]
 
     def update_signal(self, signal_id: int, **fields) -> None:

@@ -94,7 +94,8 @@ class FakeAnalysisLLM:
 
 GOOD_SETUP = dict(symbol="EURUSD", side="BUY", entry_low=1.1990, entry_high=1.2010, stop_loss=1.1950,
                   take_profit_1=1.2110, take_profit_2=1.2200, confidence="High", reason="BOS naik", wait_for="pin bar",
-                  invalid_if="close < 1.1950", valid_minutes=90)
+                  invalid_if="close < 1.1950", valid_minutes=90,
+                  score=dict(trend=18, structure=18, key_level=12, price_action=16, momentum=12, rr=10))
 
 
 def test_analysis_button_sends_text_and_respects_cooldown(bot):
@@ -102,7 +103,7 @@ def test_analysis_button_sends_text_and_respects_cooldown(bot):
     say(bot, "📊 Analisis")
     msgs = bot.notifier.msgs
     assert msgs[-3].startswith("⏳ Menganalisis") and "EURUSD naik" in msgs[-2]
-    assert msgs[-1].startswith("ℹ️ Setup tidak ditawarkan (RR 0.6 < 2)") and bot.llm.calls == 1
+    assert msgs[-1].startswith("ℹ️ Setup tidak ditawarkan (RR 0.6 < 1.5)") and bot.llm.calls == 1
     say(bot, "📊 Analisis")
     assert "Coba lagi dalam" in bot.notifier.msgs[-1] and bot.llm.calls == 1
     assert "📊 Analisis" in bot.menu_rows()[2]
@@ -202,3 +203,19 @@ def test_keyboard_payload_and_fallback(monkeypatch):
     state["up"] = False
     assert n.send_keyboard("x", [["A"]]) is False and n.pending == ["x"]   # isi pesan tetap dikirim ulang
     assert n.updates() == [] and n.retry_at > 0                              # backoff saat internet putus
+
+
+def test_two_losses_pause_until_owner_continues(bot, tsettings):
+    bot.s = tsettings.model_copy(update={"risk": tsettings.risk.model_copy(update={"stop_after_losses": 2})})
+    for i, profit in enumerate((-10.0, -12.0)):
+        bot.journal.log_trade_open(1, 100 + i, "EURUSD", 1, 0.1, 1.0, 0.99, None, 10.0)
+        bot.mt5.closed[100 + i] = {"close_price": 0.99, "close_time": datetime(2026, 1, 14, 9 + i, tzinfo=timezone.utc),
+                                   "profit": profit}
+    bot.journal.log_trade_open(1, 5, "EURUSD", 1, 0.1, 1.0, 0.9, None, 10.0)    # posisi fixture masih terbuka
+    bot.sync_closed_trades()
+    assert bot.loss_pause() and "rugi beruntun" in bot.entry_block("EURUSD", "EURUSD", 1, 10_000, 1)
+    assert bot.notifier.buttons[-1][0][0][1] == "go:1" and sum("2 rugi beruntun" in m for m in bot.notifier.msgs) == 1
+    click(bot, "go:1", chat=999)
+    assert bot.loss_pause()                                             # chat lain tidak bisa melanjutkan
+    click(bot, "go:1")
+    assert not bot.loss_pause() and "rugi beruntun" not in (bot.entry_block("EURUSD", "EURUSD", 1, 10_000, 1) or "")

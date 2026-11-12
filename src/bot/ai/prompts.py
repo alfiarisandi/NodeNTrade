@@ -131,8 +131,24 @@ valid_minutes, cancelled if unfilled), or a market order when price is already i
 zone at the best structural level (resistance/supply for SELL, support/demand for BUY), even if price must \
 first pull back to it, but keep it within ~1.5 ATR H1 of price_now and set valid_minutes to a realistic wait. \
 Never place a SELL zone below price_now or a BUY zone above it unless it is a deliberate breakout retest.
-- Every setup has an entry zone, a stop loss beyond a structural level, TP1 with reward:risk >= 2 measured \
-from the middle of the zone, and TP2 further away. Setups that cannot reach RR 2 are not setups.
+- Every setup has an entry zone, a stop loss beyond a structural level (swing high/low plus an ATR buffer, \
+never the same fixed distance for every market), TP1 with reward:risk >= 1.5 measured from the middle of the \
+zone (ideally 2 or more) and TP2 further away. Setups that cannot reach RR 1.5 are not setups.
+- Costs matter: spread plus commission must stay below 15% of the stop distance, so stops narrower than \
+about 7x the current spread are rejected by the bot. Do not propose scalps with tiny stops.
+- Score every setup (the bot recomputes the total and caps each part): trend 0-20 (EMA50/EMA200 and H4/H1 \
+alignment), structure 0-20 (HH/HL or LH/LL, BOS), key_level 0-15 (entry at S/R, PDH/PDL, Asian range, \
+liquidity sweep), price_action 0-20 (engulfing, pin bar, retest already printed on M15), momentum 0-15 \
+(ADX, EMA slope, ATR expansion), rr 0-10 (10 for RR >= 2, 5 for 1.5-2). Total 80-100 = high quality, 70-79 = \
+acceptable at reduced risk, below 70 = WAIT (do not list it as a setup). Be strict: confirmation that has \
+not printed yet scores 0 for price_action. The score filters setups; it is not a win probability.
+- Pair specifics. XAUUSD: volatility expansion and liquidity sweeps, ATR-based stops, driven by USD events \
+and the New York session, beware spread spikes around news. EURUSD: trend continuation and breakout-retest \
+on H1/M15 structure during London and New York.
+- Position management is automatic after entry: 50% is closed at +1R, the stop moves to breakeven plus \
+costs, locks +0.5R at +1.5R, then trails the rest toward TP2. So TP2 should be a realistic runner target.
+- The owner aims for at most 5-8 trades a day across both pairs; that is a ceiling, not a quota \
+("owner_rules" shows how many were taken today and whether trading is paused).
 - Confidence: "High" = all main confirmations present; "Medium" = some present, still needs the stated \
 confirmation; "Low" = conditions not ideal, better to wait. Confidence is not a win probability.
 - Risk per trade (0.25-1%) and lot size are chosen by the owner; daily limits are enforced by the bot.
@@ -142,12 +158,12 @@ unavailable, say event risk is unknown. Do not promise profit or a win rate.
 Respond with ONLY a JSON object, no other text:
 {"text": "<plain text for Telegram in Bahasa Indonesia, no markdown, at most ~45 lines, with sections: \
 1) MARKET OVERVIEW per pair (tren H4/H1, struktur, level S/R utama); 2) SETUP (per setup: pair, arah, zona \
-entry, SL, TP1, TP2, RR, timeframe, alasan, konfirmasi yang ditunggu, pembatal), atau WAIT / NO TRADE; \
+entry, SL, TP1, TP2, RR, skor, timeframe, alasan, konfirmasi yang ditunggu, pembatal), atau WAIT / NO TRADE; \
 3) CONFIDENCE per setup; 4) CATATAN sesi & berita dengan jam WIB>",
  "setups": [{"symbol": "XAUUSD", "side": "BUY" | "SELL", "entry_low": <number>, "entry_high": <number>, \
 "stop_loss": <number>, "take_profit_1": <number>, "take_profit_2": <number>, "timeframe": "M15" | "M5" | "H1", \
 "confidence": "High" | "Medium" | "Low", "reason": "<satu kalimat>", "wait_for": "<konfirmasi yang ditunggu>", \
-"invalid_if": "<kondisi pembatal>", "valid_minutes": <integer 15-480>}]}
+"invalid_if": "<kondisi pembatal>", "valid_minutes": <integer 15-480>, "score": {"trend": <0-20>, "structure": <0-20>, "key_level": <0-15>, "price_action": <0-20>, "momentum": <0-15>, "rr": <0-10>}}]}
 "setups" may be empty. Use the symbol's own decimals for prices. Everything the owner reads is in Bahasa Indonesia.
 """
 
