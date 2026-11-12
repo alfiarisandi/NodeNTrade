@@ -84,6 +84,11 @@ ai:
   # Analisis XAUUSD & EURUSD otomatis (sama seperti tombol 📊 Analisis) di jam WIB ini, Senin-Jumat.
   # Kosong = hanya saat tombol ditekan. Contoh: [14, 20] = jelang buka London & New York.
   analysis_hours_wib: []
+  # Model cadangan bila model utama (AI_MODEL di .env) kena limit / error, dicoba berurutan. Nama persis di 9Router.
+  # Diuji 2026-11-12 dengan snapshot analisis yang sama: sonnet-5-5 valid (23 dtk), haiku merespons.
+  # Model gratis di 9Router (mmf/mimo-auto, oc/muse-spark-*, oc/union-alpha, oc/jev-1.13-free) semuanya GAGAL
+  # (unavailable / protokol tidak didukung), jadi tidak dipakai.
+  fallback_models: [cc/claude-sonnet-5-5, cc/claude-haiku-4-5-20251001]
 
 backtest:
   initial_balance: 10000

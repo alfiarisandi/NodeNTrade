@@ -124,6 +124,9 @@ class AICfg(BaseModel):
     weekly_review_hour_utc: int = Field(21, ge=0, le=23)
     # Analisis harian otomatis (tombol 📊 Analisis) di jam-jam WIB ini, hari kerja; kosong = hanya saat diminta
     analysis_hours_wib: list[int] = Field(default_factory=list)
+    # Model cadangan (nama persis di 9Router) bila model utama kena limit / error, dicoba berurutan.
+    # Diisi dari AI_FALLBACK_MODELS di .env (pisahkan dengan koma) atau di sini.
+    fallback_models: list[str] = Field(default_factory=list)
     base_url: str = ""
     api_key: str = ""
     model: str = ""
@@ -262,4 +265,7 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
     ai["base_url"] = os.getenv("NINEROUTER_BASE_URL", "http://localhost:20128").rstrip("/")
     ai["api_key"] = os.getenv("NINEROUTER_API_KEY", "")
     ai["model"] = os.getenv("AI_MODEL", "")
+    fallback = [m.strip() for m in os.getenv("AI_FALLBACK_MODELS", "").split(",") if m.strip()]
+    if fallback:
+        ai["fallback_models"] = fallback
     return Settings.model_validate(raw)

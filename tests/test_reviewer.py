@@ -74,3 +74,29 @@ def test_review_prompt_covers_structure_levels_and_timeframes():
         assert key in s
     s2 = review_system(StrategyCfg(entry_tf="H1", trend_tf="D1", tp_r=2.0), 0.01)
     assert "D1 (trend), H1 (entry)" in s2 and "and H1" not in s2 and "take profit are fixed" in s2
+
+
+def test_llm_falls_back_to_next_model(monkeypatch):
+    import pytest
+    from bot.ai.client import ClaudeLLM
+    from bot.config import AICfg
+
+    llm = ClaudeLLM(AICfg(base_url="http://x", api_key="k", model="utama", fallback_models=["cadangan1", "cadangan2"]))
+    calls = []
+
+    def fake(model, system, user):
+        calls.append(model)
+        if model != "cadangan2":
+            raise LLMError(f"HTTP 429 limit {model}")
+        return "ok"
+
+    monkeypatch.setattr(llm, "_complete", fake)
+    assert llm.complete("s", "u") == "ok" and calls == ["utama", "cadangan1", "cadangan2"]
+    assert llm.last_model == "cadangan2"
+
+    def always_fail(model, system, user):
+        raise LLMError("HTTP 429")
+
+    monkeypatch.setattr(llm, "_complete", always_fail)
+    with pytest.raises(LLMError, match="semua 3 model gagal"):
+        llm.complete("s", "u")

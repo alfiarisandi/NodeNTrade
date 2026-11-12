@@ -1,11 +1,15 @@
 """Client Claude lewat 9Router (endpoint format Anthropic /v1/messages)."""
 from __future__ import annotations
 
+import logging
 from typing import Protocol
 
 import anthropic
 
 from bot.config import AICfg
+
+
+log = logging.getLogger(__name__)
 
 
 class LLMError(RuntimeError):
@@ -29,10 +33,28 @@ class ClaudeLLM:
             max_retries=1,
         )
 
+        self.last_model = cfg.model   # model yang benar-benar menjawab permintaan terakhir
+
     def complete(self, system: str, user: str) -> str:
+        """Coba model utama; jika gagal (limit, kuota, error provider) lanjut ke ai.fallback_models berurutan."""
+        models = [self.cfg.model] + [m for m in self.cfg.fallback_models if m and m != self.cfg.model]
+        first_error = None
+        for i, model in enumerate(models):
+            try:
+                text = self._complete(model, system, user)
+            except LLMError as e:
+                first_error = first_error or e
+                if i + 1 < len(models):
+                    log.warning("Model %s gagal (%s), mencoba cadangan %s", model, str(e)[:160], models[i + 1])
+                continue
+            self.last_model = model
+            return text
+        raise LLMError(f"{first_error}" + (f" (semua {len(models)} model gagal)" if len(models) > 1 else ""))
+
+    def _complete(self, model: str, system: str, user: str) -> str:
         try:
             resp = self.client.messages.create(
-                model=self.cfg.model,
+                model=model,
                 max_tokens=self.cfg.max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],

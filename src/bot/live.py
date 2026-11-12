@@ -752,7 +752,9 @@ class LiveBot:
             self.notify(f"⚠️ Analisis gagal: {e}")
             return
         now = datetime.now(timezone.utc).astimezone(WIB)
-        self.notify(f"📊 Analisis {now:%a %d/%m %H:%M} WIB\n\n{analysis.text}")
+        used = getattr(self.llm, "last_model", None)
+        backup = f" (model cadangan: {used})" if used and used != self.s.ai.model else ""
+        self.notify(f"📊 Analisis {now:%a %d/%m %H:%M} WIB{backup}\n\n{analysis.text}")
         self.offer_setups(analysis)
 
     def analysis_frames(self, bsym: str) -> dict[str, pd.DataFrame]:
