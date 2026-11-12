@@ -41,7 +41,8 @@ class ClaudeLLM:
         first_error = None
         for i, model in enumerate(models):
             try:
-                text = self._complete(model, system, user)
+                text = self._complete(model, system, user, self.cfg.max_tokens if i == 0 else
+                                      max(self.cfg.max_tokens, self.cfg.fallback_max_tokens))
             except LLMError as e:
                 first_error = first_error or e
                 if i + 1 < len(models):
@@ -51,11 +52,11 @@ class ClaudeLLM:
             return text
         raise LLMError(f"{first_error}" + (f" (semua {len(models)} model gagal)" if len(models) > 1 else ""))
 
-    def _complete(self, model: str, system: str, user: str) -> str:
+    def _complete(self, model: str, system: str, user: str, max_tokens: int | None = None) -> str:
         try:
             resp = self.client.messages.create(
                 model=model,
-                max_tokens=self.cfg.max_tokens,
+                max_tokens=max_tokens or self.cfg.max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )

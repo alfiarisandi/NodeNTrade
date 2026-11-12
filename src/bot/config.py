@@ -127,6 +127,7 @@ class AICfg(BaseModel):
     # Model cadangan (nama persis di 9Router) bila model utama kena limit / error, dicoba berurutan.
     # Diisi dari AI_FALLBACK_MODELS di .env (pisahkan dengan koma) atau di sini.
     fallback_models: list[str] = Field(default_factory=list)
+    fallback_max_tokens: int = 16000   # model cadangan (mis. DeepSeek) memakai token untuk berpikir: 4000 terpotong
     base_url: str = ""
     api_key: str = ""
     model: str = ""

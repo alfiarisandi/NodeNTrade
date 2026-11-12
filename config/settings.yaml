@@ -85,10 +85,14 @@ ai:
   # Kosong = hanya saat tombol ditekan. Contoh: [14, 20] = jelang buka London & New York.
   analysis_hours_wib: []
   # Model cadangan bila model utama (AI_MODEL di .env) kena limit / error, dicoba berurutan. Nama persis di 9Router.
-  # Diuji 2026-11-12 dengan snapshot analisis yang sama: sonnet-5-5 valid (23 dtk), haiku merespons.
-  # Model gratis di 9Router (mmf/mimo-auto, oc/muse-spark-*, oc/union-alpha, oc/jev-1.13-free) semuanya GAGAL
-  # (unavailable / protokol tidak didukung), jadi tidak dipakai.
-  fallback_models: [cc/claude-sonnet-5-5, cc/claude-haiku-4-5-20251001]
+  # Diuji 2026-11-12 dengan snapshot analisis yang sama dengan Opus:
+  # - cc/claude-sonnet-5-5: valid, 23 dtk, setup mirip Opus (tapi satu akun dengan Opus: ikut mati bila limit akun habis)
+  # - oc/big-pickle (gratis): valid, 18 dtk, setup & level mirip Opus
+  # - oc/deepseek-v4.1-flash-free (gratis): valid hanya dengan fallback_max_tokens besar; 2x uji di data sama hasilnya
+  #   berbeda (0 setup vs 2 setup) -> kurang konsisten, jadi ditaruh paling akhir
+  # - gagal: oc/glm-5.3-flash-free & oc/mimo-v2.6-flash-free (timeout 504), oc/nemotron (terpotong), mmf/mimo-auto, oc/jev
+  fallback_models: [cc/claude-sonnet-5-5, oc/big-pickle, oc/deepseek-v4.1-flash-free]
+  fallback_max_tokens: 16000
 
 backtest:
   initial_balance: 10000

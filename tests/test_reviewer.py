@@ -84,7 +84,7 @@ def test_llm_falls_back_to_next_model(monkeypatch):
     llm = ClaudeLLM(AICfg(base_url="http://x", api_key="k", model="utama", fallback_models=["cadangan1", "cadangan2"]))
     calls = []
 
-    def fake(model, system, user):
+    def fake(model, system, user, max_tokens=None):
         calls.append(model)
         if model != "cadangan2":
             raise LLMError(f"HTTP 429 limit {model}")
@@ -94,7 +94,7 @@ def test_llm_falls_back_to_next_model(monkeypatch):
     assert llm.complete("s", "u") == "ok" and calls == ["utama", "cadangan1", "cadangan2"]
     assert llm.last_model == "cadangan2"
 
-    def always_fail(model, system, user):
+    def always_fail(model, system, user, max_tokens=None):
         raise LLMError("HTTP 429")
 
     monkeypatch.setattr(llm, "_complete", always_fail)
