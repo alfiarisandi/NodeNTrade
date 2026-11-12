@@ -1,0 +1,30 @@
+# Profil akun kecil (mis. demo/real $100, akun standar lot minimum 0.01).
+# Mulai dari settings.yaml (strategi Ichimoku H4 + MA200, AI, berita, konfirmasi), lalu timpa bagian di bawah.
+# Pakai: python scripts/run_bot.py --config config/settings.small.yaml --check
+#   atau tambahkan BOT_CONFIG=config/settings.small.yaml di .env (berlaku juga untuk run_forever.ps1)
+#
+# Kenapa begini: di $100, lot 0.01 di EURUSD dengan SL 2.5 ATR H4 = rugi +-$5-7 (5-7% modal) per trade.
+# Risiko 1% tidak mungkin, jadi lot minimum dipakai selama rugi di SL <= 10%; sinyal dengan SL lebih lebar dilewati.
+# Backtest 2019-2026 (EURUSD, 0.01 lot, $100): 156 trade, $100 -> $203, drawdown terburuk -46%.
+# Simulasi 1 tahun: median $111, 39% kemungkinan rugi. Ini profil UJI di demo, bukan jaminan.
+extends: settings.yaml
+
+magic: 20261104                      # beda dari profil utama supaya posisi tidak tercampur
+journal_path: data/journal_small.db  # jurnal terpisah
+
+# XAUUSD tidak mungkin di $100 (SL +-$24 di 0.01 lot); hanya EURUSD
+symbols:
+  - {name: EURUSD, max_spread_points: 20}
+
+risk:
+  risk_per_trade: 0.005        # target normal; di $100 selalu jatuh ke lot minimum
+  min_lot_max_risk: 0.10       # lot minimum boleh dipakai selama rugi di SL <= 10% equity ($10 di $100)
+  max_open_positions: 1
+  max_daily_loss: 0.10         # satu kali kena SL bisa 5-10%; jangan blokir hari itu hanya karena 1 trade biasa
+  # Backtest terburuk -46% pada lot 0.01 di $100. Di 50% bot berhenti entry dan menunggu reset manual.
+  max_drawdown_from_peak: 0.50
+  tilt_losing_streak: 3
+
+confirm:
+  # Di $100 semua opsi jatuh ke lot 0.01 yang sama; tombol menampilkan rugi di SL dalam $ dan %
+  risk_options: [0.005]

@@ -1,0 +1,106 @@
+# Konfigurasi bot. Kredensial TIDAK di sini, tapi di file .env
+
+# dry_run = hanya catat sinyal & keputusan AI, tidak kirim order
+# live    = kirim order (tetap hanya ke akun DEMO, dicek otomatis)
+mode: dry_run
+
+# Magic number untuk menandai posisi milik bot ini
+magic: 20261103
+
+# Suffix nama simbol di broker, contoh ".m" atau "c" (cek via: run_bot.py --check)
+symbol_suffix: ".m"   # MIFX / Monex-Demo
+
+# max_spread_points dalam satuan "point" broker (EURUSD 5 digit: 10 point = 1 pip).
+# Sesuaikan setelah melihat spread nyata di --check.
+symbols:
+  - {name: EURUSD, max_spread_points: 20}
+  # 11 pair diuji 2026-11-12: out-of-sample 2024-sekarang PF 0.89, DD 17% -> tetap 2 pair.
+  - {name: XAUUSD, max_spread_points: 50}
+
+strategy:
+  # Ichimoku H4 (9/26/52): kandidat terbaik dari scripts/variants.py.
+  # Backtest: in-sample 2019-2023 PF 1.26, out-of-sample 2024-2026 PF 1.09.
+  # Kembali ke v1 (EMA cross H1): hapus 6 baris entry_type..exit_rule dan pakai nilai v1 di komentar.
+  entry_type: ichimoku
+  entry_tf: H4
+  trend_tf: D1
+  trend_filter: none
+  session_hours: true   # entry hanya di jam session di bawah (jam kerja WIB)
+  exit_rule: signal     # keluar saat Tenkan memotong balik Kijun
+  ema_fast: 20
+  ema_slow: 50
+  ema_trend: 200        # dihitung di H4
+  adx_period: 14
+  adx_min: 0            # Ichimoku tanpa filter ADX (v1: 20)
+  rsi_period: 14
+  rsi_buy_max: 70
+  rsi_sell_min: 30
+  atr_period: 14
+  sl_atr_mult: 2.5      # v1: 1.5
+  tp_atr_mult: 0        # 0 = tanpa TP, keluar lewat sinyal (v1: 3.0)
+  breakeven_at_r: 0     # geser SL ke entry saat profit 1R (0 = nonaktif; v1: 1.0)
+  # Filter konfirmasi (scripts/variants.py --family cf). MA200 lolos in-sample (PF 1.18 -> 1.23)
+  # dan out-of-sample (PF 1.46 -> 1.62). MACD netral, ATR memperburuk -> nonaktif.
+  ma_filter: true
+  macd_filter: false
+  atr_ratio_min: 0
+
+session:
+  # Jam WIB 08-23: candle H4 close 09:00, 13:00, 17:00, 21:00 WIB (= 02, 06, 10, 14 UTC). Exit/SL/TP tetap jalan 24 jam.
+  # Backtest EURUSD+XAUUSD: PF in-sample 1.45, out-of-sample 1.58, DD maks 6.2%.
+  # Lebih ketat (PF lebih tinggi, entry lebih sedikit): end_hour_utc: 11 = 08-18 WIB -> PF 1.62 / 1.83.
+  start_hour_utc: 1     # 08:00 WIB
+  end_hour_utc: 15      # 22:00 WIB (close terakhir 21:00 WIB)
+  friday_cutoff_hour_utc: 18
+  # Selisih jam server broker terhadap UTC. Kosongkan (null) untuk deteksi otomatis.
+  server_utc_offset_hours: null
+
+risk:
+  risk_per_trade: 0.005     # 0.5% equity per trade, menekan drawdown (batas keras di kode: maks 1%)
+  max_daily_loss: 0.03      # berhenti buka posisi baru jika rugi hari ini >= 3%
+  max_open_positions: 3
+  max_currency_exposure: 2  # maks 2 posisi searah pada mata uang yang sama (mis. 2x short USD)
+  # Circuit breaker: stop entry baru jika equity turun 15% dari puncak; reset manual (tombol Telegram / --reset-dd).
+  # 15% > drawdown terburuk backtest Ichimoku 2019-2026 (13%): terpicu = strategi lebih buruk dari sejarahnya.
+  max_drawdown_from_peak: 0.15
+  # Cek tilt: setelah 3 rugi beruntun, tombol risiko di atas risk_per_trade (0.5%) disembunyikan (0 = nonaktif)
+  tilt_losing_streak: 3
+  take_profit_usd: 25       # tutup posisi saat profit floating >= $25 (0 = nonaktif)
+  max_hold_days: 0          # tutup paksa setelah N hari (0 = nonaktif). Backtest: batas 3 hari menurunkan PF 1.22 -> 1.12
+  trail_lock_fraction: 0.6  # profit >= $25 & tren masih searah: tidak ditutup, SL dikunci di 60% gerak profit (0 = tutup di $25)
+
+ai:
+  enabled: true
+  on_failure: skip          # skip = lewati sinyal jika AI error | rule_only = tetap trade tanpa AI
+  timeout_seconds: 180
+  max_tokens: 4000
+  daily_review_hour_utc: 21
+  weekly_review_weekday: 4      # laporan mingguan tiap Jumat (UTC) ...
+  weekly_review_hour_utc: 21    # ... pukul 21:00 UTC = Sabtu 04:00 WIB
+
+backtest:
+  initial_balance: 10000
+  commission_per_lot: 10.0      # komisi round-turn per 1 lot (Monex-Demo: $5/sisi, dicek dari history)
+  slippage_points: 2
+  default_spread_points: 15     # dipakai jika data bar tidak punya spread
+
+# Kalender ekonomi (ForexFactory, minggu berjalan). Cek: run_bot.py --news
+news:
+  enabled: true
+  block_impacts: [High]
+  block_before_hours: 4     # tidak entry jika ada event High untuk mata uang pair ini dalam 4 jam ke depan
+  block_after_hours: 1      # ... atau event itu baru lewat kurang dari 1 jam
+  context_days: 5           # event High/Medium 5 hari ke depan diberikan ke Claude
+  refresh_minutes: 180
+
+# Konfirmasi manual lewat tombol Telegram sebelum order (hanya mode --live, sinyal yang disetujui AI)
+confirm:
+  enabled: true
+  timeout_minutes: 30           # tidak dijawab = batal (dicatat sebagai shadow trade)
+  risk_options: [0.0025, 0.005, 0.01]   # tombol 0.25% / 0.5% / 1% (batas keras maks 1%)
+  max_price_move_atr: 0.5       # batal jika harga sudah bergerak > 0.5 ATR dari harga sinyal
+
+journal_path: data/journal.db
+data_dir: data
+reports_dir: reports
+poll_seconds: 20
