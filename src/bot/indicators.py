@@ -49,6 +49,17 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return _wilder(dx, period)
 
 
+def session_vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series,
+                 session_id: pd.Series) -> pd.Series:
+    """VWAP yang di-reset tiap session_id berganti (mis. tanggal sesi). Harga tipikal (H+L+C)/3 x volume.
+    Di forex spot volume = tick volume broker (jumlah perubahan harga), jadi ini pendekatan, bukan VWAP bursa."""
+    typical = (high + low + close) / 3
+    vol = volume.clip(lower=1).astype(float)   # bar tanpa volume tetap dihitung bobot 1
+    key = session_id.to_numpy()
+    pv = (typical * vol).groupby(key).cumsum()
+    return pv / vol.groupby(key).cumsum()
+
+
 def supertrend(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 10,
                mult: float = 3.0) -> pd.Series:
     """Arah Supertrend per bar: 1 = naik, -1 = turun (rumus standar TradingView)."""

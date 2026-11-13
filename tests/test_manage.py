@@ -79,6 +79,31 @@ def test_toggle_off_stops_management(env):
     assert pos.sl == pytest.approx(env.entry - R) and env.mt5.sl_moves == []
 
 
+def test_partial_at_usd_fires_before_r_target(env):
+    # 0.10 lot EURUSD: $10 = 10 pip = 0.25R (R = 40 pip), lebih dulu dari target 1R
+    env.bot.s = env.bot.s.model_copy(update={"manage": env.bot.s.manage.model_copy(
+        update={"partial_at_r": 1.0, "partial_at_usd": 10.0})})
+    pos = env.open_pos()
+    env.at(0.1)                      # siklus 1: TP server -> TP2
+    env.at(0.2)
+    assert env.mt5.partials == []    # profit baru $8
+    env.at(0.26)
+    assert env.mt5.partials == [(5, 0.05)] and pos.volume == pytest.approx(0.05)
+    env.at(0.26)
+    assert pos.sl > env.entry        # sisa posisi: SL breakeven + biaya
+    small = env.open_pos(ticket=6, volume=0.01)
+    env.at(0.5)
+    assert small.volume == 0.01 and small.tp == pytest.approx(env.entry + 2 * R)   # lot minimum: tidak dibagi
+
+
+def test_symbol_max_lot_caps_order_size(env):
+    assert env.bot.lot_for("EURUSD", 10_000, 0.01, 0.0010) == pytest.approx(1.0)   # $100 / 10 pip
+    sym = env.bot.s.symbols[0].model_copy(update={"max_lot": 0.1})
+    env.bot.s = env.bot.s.model_copy(update={"symbols": [sym]})
+    assert env.bot.lot_for("EURUSD", 10_000, 0.01, 0.0010) == pytest.approx(0.1)
+    assert env.bot.lot_for("EURUSD", 10_000, 0.0025, 0.0050) == pytest.approx(0.05)  # di bawah batas: tidak berubah
+
+
 def test_partial_at_1r_default(env):
     env.bot.s = env.bot.s.model_copy(update={"manage": env.bot.s.manage.model_copy(update={"partial_at_r": 1.0})})
     pos = env.open_pos()

@@ -10,12 +10,13 @@ from pydantic import BaseModel, Field, ValidationError
 
 from bot.ai.client import LLM
 from bot.ai.prompts import ANALYSIS_SYSTEM, POSITION_SYSTEM
+from bot.intraday import SCORE_WEIGHTS, STRATEGIES
 
 MIN_RR = 1.5              # minimal reward:risk TP1 (ideal 2+)
-MIN_SCORE = 70            # skor setup di bawah ini = WAIT
-FULL_RISK_SCORE = 80      # di bawah ini hanya boleh risiko <= risk_per_trade
+MIN_SCORE = 65            # skor setup di bawah ini = WAIT / NO TRADE
+VALID_SCORE = 75          # 65-74 = conditional: hanya opsi risiko terkecil
+FULL_RISK_SCORE = 85      # premium; 75-84 = valid: hanya boleh risiko <= risk_per_trade
 MAX_COST_R = 0.15         # spread + komisi maksimal 15% dari R: SL lebih sempit dari itu tidak layak
-SCORE_WEIGHTS = {"trend": 20, "structure": 20, "key_level": 15, "price_action": 20, "momentum": 15, "rr": 10}
 SL_ATR_RANGE = (0.3, 3.0)     # jarak SL dalam ATR H1 yang masuk akal untuk day trade
 MAX_ZONE_ATR = 1.0            # zona entry lebih lebar dari 1 ATR H1 = bukan zona
 
@@ -35,9 +36,15 @@ class Setup(BaseModel):
     invalid_if: str = ""
     valid_minutes: int = Field(120, ge=15, le=480)
     score: dict[str, float] = Field(default_factory=dict)   # komponen skor, lihat SCORE_WEIGHTS
+    strategy: str = ""    # A-E (bot.intraday.STRATEGIES); kosong = tidak diberi label
+    regime: str = ""      # TREND | RANGE | MIXED saat setup dibuat
 
     def model_post_init(self, __context) -> None:
         self.symbol = self.symbol.upper().strip()
+        self.strategy = self.strategy.upper().strip()[:1]
+        if self.strategy not in STRATEGIES:
+            self.strategy = ""
+        self.regime = self.regime.upper().strip()
         if self.entry_low > self.entry_high:
             self.entry_low, self.entry_high = self.entry_high, self.entry_low
 
@@ -45,6 +52,12 @@ class Setup(BaseModel):
     def score_total(self) -> int:
         """Total skor dihitung ulang di kode: tiap komponen dibatasi bobot maksimumnya."""
         return round(sum(min(max(float(self.score.get(k, 0)), 0.0), w) for k, w in SCORE_WEIGHTS.items()))
+
+    @property
+    def grade(self) -> str:
+        t = self.score_total
+        return ("Premium" if t >= FULL_RISK_SCORE else "Valid" if t >= VALID_SCORE
+                else "Conditional" if t >= MIN_SCORE else "No Trade")
 
     @property
     def direction(self) -> int:
@@ -118,7 +131,8 @@ def analyze_market(llm: LLM, context_json: str, system: str = ANALYSIS_SYSTEM) -
 def format_setup(s: Setup, digits: int) -> str:
     f = f".{digits}f"
     tp2 = f" | TP2 {s.take_profit_2:{f}}" if s.take_profit_2 is not None else ""
-    lines = [f"{s.side} {s.symbol} ({s.timeframe}, skor {s.score_total}/100, confidence {s.confidence})",
+    label = f"strategi {s.strategy} {STRATEGIES[s.strategy]}, " if s.strategy else ""
+    lines = [f"{s.side} {s.symbol} ({label}{s.timeframe}, skor {s.score_total}/100 {s.grade}, confidence {s.confidence})",
              f"Zona {s.entry_low:{f}}-{s.entry_high:{f}} | SL {s.stop_loss:{f}} | TP1 {s.take_profit_1:{f}}{tp2} "
              f"| RR {s.rr:.1f}"]
     if s.reason:

@@ -10,6 +10,7 @@ import pandas as pd
 
 from bot.config import StrategyCfg
 from bot.indicators import atr
+from bot.intraday import REGIME_STRATEGIES, mtf_features
 from bot.strategy import Signal, add_indicators, candle_flags
 
 WIB = timezone(timedelta(hours=7))
@@ -48,6 +49,13 @@ def tf_summary(df: pd.DataFrame, p: StrategyCfg, digits: int, swing_bars: int = 
         "adx": _r(last["adx"], 1),
         "adx_5bars_ago": _r(f["adx"].iloc[-6], 1) if len(f) > 6 else None,
         "rsi": _r(last["rsi"], 1),
+        # Bollinger Band (bb_period, bb_std): %B 0 = di band bawah, 100 = di band atas, di luar 0-100 = menembus band
+        "bb_upper": _r(last["bb_up"], digits),
+        "bb_mid": _r(last["bb_mid"], digits),
+        "bb_lower": _r(last["bb_low"], digits),
+        "bb_percent_b": _r(100 * (last["close"] - last["bb_low"]) / (last["bb_up"] - last["bb_low"]), 0)
+        if last["bb_up"] > last["bb_low"] else None,
+        "bb_width_atr": _r((last["bb_up"] - last["bb_low"]) / atr_, 2) if atr_ and not np.isnan(atr_) else None,
         "atr": _r(atr_, digits),
         "atr_percentile_100bars": _r(pct, 0),
         f"swing_high_{swing_bars}bars": _r(swing_high, digits),
@@ -219,6 +227,60 @@ def session_info(now: datetime) -> dict:
     }
 
 
+def intraday_snapshot(frames: dict[str, pd.DataFrame], digits: int, fvg_lookback: int = 60) -> dict:
+    """Regime, bias H4/H1, VWAP sesi, sweep terakhir, FVG M15 yang belum terisi, order block terakhir dan posisi
+    premium/discount, dihitung dengan fungsi yang sama dengan backtest (bot.intraday). {} bila data kurang."""
+    need = {"M15": 250, "H1": 210, "H4": 210}
+    if any(tf not in frames or len(frames[tf]) < n for tf, n in need.items()):
+        return {}
+    f = mtf_features({tf: frames[tf] for tf in need})
+    last, n = f.iloc[-1], len(f)
+    a = float(last["atr"])
+    if not a or np.isnan(a):
+        return {}
+    bias = {1: "bullish", -1: "bearish", 0: "neutral"}
+    o, h, l, c = (f[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    gaps = []
+    for k in range(max(n - fvg_lookback, 2), n):
+        if l[k] > h[k - 2] and l[k + 1:].min(initial=np.inf) > h[k - 2]:      # belum terisi penuh
+            gaps.append({"type": "bullish", "low": _r(h[k - 2], digits), "high": _r(l[k], digits),
+                         "time": f["time"].iloc[k].strftime("%m-%d %H:%M")})
+        elif h[k] < l[k - 2] and h[k + 1:].max(initial=-np.inf) < l[k - 2]:
+            gaps.append({"type": "bearish", "low": _r(h[k], digits), "high": _r(l[k - 2], digits),
+                         "time": f["time"].iloc[k].strftime("%m-%d %H:%M")})
+    block = None
+    disp = np.flatnonzero(f["disp"].to_numpy()[-fvg_lookback:] != 0)
+    if len(disp):
+        k = n - min(fvg_lookback, n) + int(disp[-1])
+        d = int(f["disp"].iloc[k])
+        prior = [j for j in range(k - 1, max(k - 6, 0) - 1, -1) if d * (c[j] - o[j]) < 0]
+        if prior:
+            block = {"type": bias[d], "low": _r(l[prior[0]], digits), "high": _r(h[prior[0]], digits),
+                     "displacement_time": f["time"].iloc[k].strftime("%m-%d %H:%M")}
+    lo50, hi50 = float(last["h1_lo50"]), float(last["h1_hi50"])
+    pos = (float(last["close"]) - lo50) / (hi50 - lo50) if hi50 > lo50 else np.nan
+
+    def ago(col):
+        return int(last[col]) if last[col] <= 96 else None
+
+    return {
+        "regime": last["regime"], "high_volatility": bool(last["high_vol"]),
+        "strategies_for_regime": list(REGIME_STRATEGIES[last["regime"]]),
+        "h4_bias": bias[int(last["h4_dir"])] + (" (EMA50 slope agrees)" if last["h4_strong"] else ""),
+        "h1_bias": bias[int(last["h1_dir"])],
+        "h1_adx": _r(last["h1_adx"], 1),
+        "ema20_M15": _r(last["ema20"], digits),
+        "session_vwap": _r(last["vwap"], digits),
+        "close_vs_vwap_atr_M15": _r((last["close"] - last["vwap"]) / a, 2),
+        "dealing_range_H1_50bars": {"low": _r(lo50, digits), "high": _r(hi50, digits), "position_%": _r(100 * pos, 0),
+                                    "zone": None if np.isnan(pos) else "premium" if pos > 0.5 else "discount"},
+        "last_bullish_sweep_M15_bars_ago": ago("since_bull_sweep"),
+        "last_bearish_sweep_M15_bars_ago": ago("since_bear_sweep"),
+        "open_fvg_M15": gaps[-3:],
+        "last_order_block_M15": block,
+    }
+
+
 def build_analysis_context(per_symbol: dict[str, dict[str, pd.DataFrame]], p: StrategyCfg, metas: dict[str, dict],
                            spreads: dict[str, float], now: datetime, offset_hours: int = 0, calendar=None,
                            account: dict | None = None, positions: list[dict] | None = None,
@@ -235,6 +297,7 @@ def build_analysis_context(per_symbol: dict[str, dict[str, pd.DataFrame]], p: St
             "price_now": {k: _r(v, digits) for k, v in (prices or {}).get(sym, {}).items()},
             "spread_points": _r(spreads.get(sym), 1),
             "market": market_summary({tf: frames[tf] for tf in ("H4", "H1", "M15") if tf in frames}, p, digits),
+            "intraday": intraday_snapshot(frames, digits),
             "key_levels": key_levels(frames, p, digits, offset_hours, now),
             "structure": {tf: market_structure(frames[tf], digits) for tf in ("H1", "M15") if tf in frames},
             "candles": {tf: candle_patterns(frames[tf], digits) for tf in ("H1", "M15") if tf in frames},

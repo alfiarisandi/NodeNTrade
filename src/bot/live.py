@@ -9,10 +9,11 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from bot.ai.analysis import (FULL_RISK_SCORE, MIN_RR, Analysis, analyze_market, format_setup, review_positions,
-                             validate_setup)
+from bot.ai.analysis import (FULL_RISK_SCORE, MIN_RR, VALID_SCORE, Analysis, analyze_market, format_setup,
+                             review_positions, validate_setup)
 from bot.ai.client import LLM
-from bot.ai.context import build_analysis_context, build_review_context, market_structure, market_summary
+from bot.ai.context import (build_analysis_context, build_review_context, intraday_snapshot, market_structure,
+                            market_summary, session_info, tf_summary)
 from bot.ai.daily_review import daily_report, weekly_report
 from bot.ai.prompts import review_system
 from bot.ai.reviewer import ReviewOutcome, review_signal
@@ -192,6 +193,10 @@ class LiveBot:
             self.process_symbol(sym.name)
         if new_bar:
             self.resolve_shadows()
+        try:
+            self.maybe_candle_report(now)
+        except Exception:   # laporan informatif: jangan ikut memicu kill switch
+            log.exception("Laporan candle gagal")
         self.maybe_daily_review(now)
         self.maybe_weekly_review(now)
         self.maybe_scheduled_analysis(now)
@@ -310,8 +315,11 @@ class LiveBot:
         return f"berita {news.impact} {news.currency}: {news.title} ({when})"
 
     def lot_for(self, sym: str, equity: float, risk: float, sl_distance: float) -> float:
-        """Lot untuk risiko `risk` x equity; akun kecil memakai lot minimum bila risikonya <= min_lot_max_risk."""
-        return lot_with_min(equity, risk, max(risk, self.s.risk.min_lot_max_risk), sl_distance, self.meta[sym])
+        """Lot untuk risiko `risk` x equity; akun kecil memakai lot minimum bila risikonya <= min_lot_max_risk.
+        Dibatasi symbols[].max_lot bila diisi."""
+        lot = lot_with_min(equity, risk, max(risk, self.s.risk.min_lot_max_risk), sl_distance, self.meta[sym])
+        cap = self.s.symbol_cfg(sym).max_lot
+        return min(lot, cap) if cap > 0 else lot
 
     def risk_amount(self, sym: str, lot: float, sl_distance: float) -> float:
         """Kerugian sebenarnya (mata uang akun) jika SL kena."""
@@ -352,7 +360,7 @@ class LiveBot:
         streak = self.tilt_streak()
         seen = set()
         for r in self.allowed_risk_options():
-            if max_risk is not None and r > max_risk + 1e-12:   # setup skor 70-79: tanpa opsi risiko besar
+            if max_risk is not None and r > max_risk + 1e-12:   # setup skor di bawah premium: tanpa opsi risiko besar
                 continue
             opt_lot = self.lot_for(sym, equity, r, sig.sl_distance)
             if opt_lot > 0 and opt_lot not in seen:   # akun kecil: beberapa opsi bisa jadi lot minimum yang sama
@@ -867,10 +875,79 @@ class LiveBot:
                                    text + "\nKlik: harga belum di zona = pasang order LIMIT di tengah zona; sudah lewat zona = market jika RR masih cukup.",
                                    timeout_minutes=min(self.s.confirm.timeout_minutes, st.valid_minutes),
                                    suggest_label="Risiko dasar",
-                                   max_risk=None if st.score_total >= FULL_RISK_SCORE else suggested)
+                                   max_risk=self.setup_max_risk(st.score_total, suggested))
         if not ok:
             self.journal.update_signal(sid, skip_reason="pesan konfirmasi Telegram gagal terkirim")
             self.journal.open_shadow(sid, st.entry_mid, st.stop_loss, st.take_profit_1)
+
+    def setup_max_risk(self, score: int, suggested: float) -> float | None:
+        """Batas opsi risiko menurut skor setup: premium = semua opsi, valid = sampai risiko dasar,
+        conditional = hanya opsi terkecil."""
+        if score >= FULL_RISK_SCORE:
+            return None
+        return suggested if score >= VALID_SCORE else min(self.s.confirm.risk_options)
+
+    # ---------- ringkasan tiap close candle (tanpa AI) ----------
+    def maybe_candle_report(self, now: datetime) -> None:
+        """Kirim ringkasan sekali per candle candle_report.timeframe yang baru close, di jam WIB yang diatur.
+        Candle yang close lebih dari satu timeframe lalu (bot baru menyala, pasar tutup) dilewati."""
+        c = self.s.candle_report
+        if not c.enabled or not self.meta:
+            return
+        last = self.mt5.rates(self.s.broker_symbol(self.s.symbols[0].name), c.timeframe, 1)
+        if last.empty:
+            return
+        bar = last["time"].iloc[-1]
+        key, stamp = f"candle_report:{c.timeframe}", str(bar)
+        if self.journal.get_state(key) == stamp:
+            return
+        self.journal.set_state(key, stamp)
+        tf = TF_DELTA[c.timeframe]
+        close_utc = (bar + tf - pd.Timedelta(hours=self.offset)).tz_localize("UTC")
+        close_wib = close_utc.tz_convert(WIB)
+        if pd.Timestamp(now) - close_utc > tf or not c.start_hour_wib <= close_wib.hour <= c.end_hour_wib:
+            return
+        self.notify(self.candle_report_text(now, c.timeframe, bar + tf, close_wib))
+
+    def candle_report_text(self, now: datetime, tf: str, close_srv: pd.Timestamp, close_wib: pd.Timestamp) -> str:
+        p = self.s.strategy
+        lines = [f"🕐 Candle {tf} close {close_wib:%H:%M} WIB | sesi {session_info(now)['label']}"]
+        for sym, meta in self.meta.items():
+            digits = meta["digits"]
+            frames = self.analysis_frames(self.s.broker_symbol(sym))
+            bars = frames.get(tf) if tf in frames else self.mt5.rates(self.s.broker_symbol(sym), tf, 2)
+            head = sym
+            if bars is not None and len(bars):
+                b = bars.iloc[-1]
+                arrow = "▲" if b["close"] > b["open"] else "▼" if b["close"] < b["open"] else "■"
+                head += (f" {b['close']:.{digits}f} | {tf} {arrow} {100 * (b['close'] / b['open'] - 1):+.2f}% "
+                         f"(H {b['high']:.{digits}f} L {b['low']:.{digits}f})")
+            lines.append(head)
+            snap = intraday_snapshot(frames, digits)
+            if snap:
+                vwap_side = "di atas" if snap["close_vs_vwap_atr_M15"] > 0 else "di bawah"
+                lines.append(f"  Regime {snap['regime']}{' · volatil' if snap['high_volatility'] else ''} | "
+                             f"H4 {snap['h4_bias'].split()[0]}, H1 {snap['h1_bias']}, ADX H1 {snap['h1_adx']}")
+                lines.append(f"  {vwap_side.capitalize()} VWAP {snap['session_vwap']:.{digits}f} "
+                             f"({snap['close_vs_vwap_atr_M15']:+.1f} ATR M15) | zona "
+                             f"{snap['dealing_range_H1_50bars']['zone'] or '-'}")
+            if "H1" in frames and len(frames["H1"]) > p.ema_trend:
+                h1 = tf_summary(frames["H1"], p, digits)
+                pb = h1["bb_percent_b"]
+                lines.append(f"  RSI H1 {h1['rsi']} | Bollinger H1 %B {pb if pb is not None else '-'}")
+        # Status sinyal Ichimoku: candle H4 baru close bersamaan dengan candle ini?
+        etf = TF_DELTA[p.entry_tf]
+        if close_srv == close_srv.floor(etf):
+            found = [sym for sym in self.meta if self.journal.signal_exists(sym, str(close_srv - etf))]
+            lines.append(f"Sinyal Ichimoku {p.entry_tf}: " + (f"ada ({', '.join(found)}), lihat pesan sinyal"
+                                                             if found else "tidak ada"))
+        else:
+            lines.append(f"Candle {p.entry_tf} (sinyal Ichimoku) berikut: {self.next_entry_close(now)}")
+        positions = self.mt5.positions(self.s.magic)
+        limits = len(self.journal.limit_orders())
+        lines.append(f"Posisi terbuka: {len(positions)}" + (f" | order limit menunggu: {limits}" if limits else "")
+                     + " | setup AI: tekan 📊 Analisis")
+        return "\n".join(lines)
 
     def maybe_scheduled_analysis(self, now: datetime) -> None:
         wib = now.astimezone(WIB)
@@ -1237,6 +1314,10 @@ class LiveBot:
             return
         part_px = entry + d * cfg.partial_at_r * r_dist if cfg.partial_at_r else tp1
         part_px = part_px if d * (tp1 - part_px) > 0 else tp1          # tidak pernah melewati TP1
+        if cfg.partial_at_usd and pos.volume > 0:
+            # Target uang: jarak harga yang membuat profit floating posisi ini = partial_at_usd; pakai yang lebih dekat
+            usd_px = entry + d * cfg.partial_at_usd * meta["tick_size"] / (meta["tick_value"] * pos.volume)
+            part_px = usd_px if d * (part_px - usd_px) > 0 else part_px
         if st.get("tp_moved") and not st.get("partial") and d * (px - part_px) >= 0:
             step = meta["volume_step"]
             vol = round(max(math.floor(pos.volume * cfg.partial_frac / step + 1e-9) * step, meta["volume_min"]), 8)
@@ -1453,6 +1534,7 @@ class LiveBot:
                                       "ai_reasons", "skip_reason", "executed")}
                    for r in self.journal.signals_since(start)]
         trades = [dict(r) for r in self.journal.trades_since(start)]
+        results = intraday_stats([r for r in self.journal.closed_trades() if (r["close_time"] or "") >= start])
 
         text = None
         if self.llm:
@@ -1463,12 +1545,15 @@ class LiveBot:
                 calendar = (self.calendar.upcoming_all(now, 48, currencies)
                             if self.calendar and self.calendar.available else None)
                 text = daily_report(self.llm, now.date().isoformat(), account, signals, trades, markets,
-                                    self.journal.ai_vs_rules(), calendar)
+                                    self.journal.ai_vs_rules(), calendar, results)
             except Exception as e:
                 log.warning("Laporan harian AI gagal: %s", e)
         if text is None:
-            closed = [t for t in trades if t["status"] == "closed"]
             text = (f"Equity {account['equity']} {account['currency']} ({account['today_pnl_%']:+.2f}% hari ini)\n"
-                    f"Sinyal: {len(signals)} | Trade ditutup: {len(closed)} | "
-                    f"Profit: {sum(t['profit'] or 0 for t in closed):+.2f}")
+                    f"Sinyal: {len(signals)} | Trade ditutup: {results['trades']}")
+            if results["trades"]:
+                pf = results["profit_factor"] if results["profit_factor"] is not None else "-"
+                text += (f" | Win rate {results['winrate_%']}%\n"
+                         f"Gross profit {results['gross_profit']:+.2f} | gross loss {results['gross_loss']:+.2f} | "
+                         f"net {results['net']:+.2f}\nProfit factor {pf} | expectancy {results['expectancy']:+.2f}")
         self.notify(f"📊 Laporan harian {now.date().isoformat()}\n\n{text}")

@@ -106,10 +106,22 @@ def _streaks(profits: list[float]) -> tuple[int, int]:
     return best_w, best_l
 
 
+def _setup_field(row, key: str) -> str:
+    """Field dari JSON setup 📊 yang tersimpan bersama trade (strategy / regime); '?' bila tidak ada."""
+    try:
+        raw = row["setup"]
+    except (KeyError, IndexError):
+        return "?"
+    try:
+        return str((json.loads(raw) if raw else {}).get(key) or "?")
+    except (TypeError, ValueError):
+        return "?"
+
+
 def intraday_stats(rows) -> dict:
     """Statistik trade tertutup (urut waktu tutup): win rate, rata-rata menang/kalah, profit factor, expectancy
     (= win rate x rata-rata menang - loss rate x rata-rata kalah, profit sudah bersih dari komisi/swap),
-    drawdown maksimum, beruntun, lama tahan, dan rincian per pair & per sesi."""
+    drawdown maksimum, beruntun, lama tahan, dan rincian per pair, sesi, strategi & regime."""
     n = len(rows)
     if n == 0:
         return {"trades": 0}
@@ -145,6 +157,8 @@ def intraday_stats(rows) -> dict:
         "expectancy_R": round(sum(rs) / len(rs), 3) if rs else None,
         "total_R": round(sum(rs), 2) if rs else None,
         "net": round(sum(profits), 2),
+        "gross_profit": round(sum(wins), 2),
+        "gross_loss": round(sum(losses), 2),
         "max_drawdown": round(dd, 2),
         "max_win_streak": best_w,
         "max_loss_streak": best_l,
@@ -152,6 +166,8 @@ def intraday_stats(rows) -> dict:
         "by_symbol": group(lambda r: r["symbol"]),
         "by_session": group(lambda r: session_info(datetime.fromisoformat(r["open_time"]))["label"]
                             if r["open_time"] else "?"),
+        "by_strategy": group(lambda r: _setup_field(r, "strategy")),
+        "by_regime": group(lambda r: _setup_field(r, "regime")),
     }
 
 
@@ -166,7 +182,10 @@ def format_evaluation(title: str, st: dict, what_if: dict | None = None) -> str:
              + (f" ({st['expectancy_R']:+.2f}R, total {st['total_R']:+.2f}R)" if st["expectancy_R"] is not None else ""),
              f"Drawdown maks {st['max_drawdown']:.2f} | beruntun menang {st['max_win_streak']}, kalah {st['max_loss_streak']}"
              + (f" | tahan rata-rata {st['avg_hold_minutes']} menit" if st["avg_hold_minutes"] is not None else "")]
-    for label, key in (("Per pair", "by_symbol"), ("Per sesi", "by_session")):
+    for label, key in (("Per pair", "by_symbol"), ("Per sesi", "by_session"), ("Per strategi", "by_strategy"),
+                       ("Per regime", "by_regime")):
+        if set(st.get(key, {})) <= {"?"}:   # trade lama tanpa label strategi / regime
+            continue
         lines.append(f"{label}: " + "; ".join(f"{k} {v['trades']}x, win {v['winrate_%']}%, net {v['net']:+.2f}"
                                                for k, v in st[key].items()))
     if what_if and what_if.get("n"):

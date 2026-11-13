@@ -8,6 +8,7 @@
   python scripts/variants.py --family sm           # Ichimoku H4 + MA200 di akun $100 (profil settings.small.yaml)
   python scripts/variants.py --family ex           # proteksi profit (BE / trailing / kunci / TP) di setelan live
   python scripts/variants.py --family dd           # day trade spek Daily Trading Strategist (EMA50/200, PDH, range Asia, RR 2)
+  python scripts/variants.py --family wr [--oos]   # win rate vs profit: TP penuh / parsial di atas setelan live
   python scripts/variants.py --validate NAMA       # varian terpilih di out-of-sample 2024-sekarang
 """
 import argparse
@@ -216,8 +217,18 @@ XS_VARIANTS: dict[str, dict] = {f"{b}|{k}": {**base, **pol}
                                 for b, base in (("pdh", DD_PDH), ("pullback", {**DD_PB, "ma50_filter": True}))
                                 for k, pol in XS_POLICIES.items()}
 
+# Batas win rate vs profit di atas setelan live (Ichimoku H4 + MA200, satu-satunya strategi yang punya edge):
+# TP penuh di N R, atau TP parsial (50% / 70% lot di N R) dengan sisa posisi tetap keluar lewat sinyal Ichimoku.
+# _BE = sisa posisi SL ke breakeven + spread setelah parsial; _SLawal = sisa posisi tetap memakai SL awal.
+WR_VARIANTS: dict[str, dict] = {
+    "wr_live_tanpa_TP": {},
+    **{f"wr_tp{r:g}R": {"tp_r": r} for r in (0.5, 1.0, 1.5, 2.0, 3.0)},
+    **{f"wr_parsial{int(100 * fr)}%_{r:g}R_{label}": {"partial_r": r, "partial_frac": fr, "partial_keep_sl": keep}
+       for r in (0.5, 1.0, 1.5, 2.0) for fr in (0.5, 0.7) for label, keep in (("BE", False), ("SLawal", True))},
+}
+
 VARIANTS = {**TREND_VARIANTS, **MR_VARIANTS, **OS_VARIANTS, **CF_VARIANTS, **DT_VARIANTS, **SM_VARIANTS,
-            **DY_VARIANTS, **EX_VARIANTS, **DD_VARIANTS, **XS_VARIANTS}
+            **DY_VARIANTS, **EX_VARIANTS, **DD_VARIANTS, **XS_VARIANTS, **WR_VARIANTS}
 
 
 def evaluate(s, names, data_dir, start, end) -> tuple[dict, dict]:
@@ -266,7 +277,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="2024-01-01")
     ap.add_argument("--from", dest="start", default="2019-01-01")
-    ap.add_argument("--family", choices=["tf", "mr", "os", "cf", "dt", "sm", "dy", "ex", "dd", "xs"], default="tf",
+    ap.add_argument("--oos", action="store_true", help="jalankan seluruh family di out-of-sample (setelah --split)")
+    ap.add_argument("--family", choices=["tf", "mr", "os", "cf", "dt", "sm", "dy", "ex", "dd", "xs", "wr"], default="tf",
                     help="tf = trend following, mr = mean reversion, os = strategi open source, "
                          "cf = Ichimoku H4 + filter MA/MACD/ATR, dt = day trade akun kecil, "
                          "sm = Ichimoku H4 + MA200 akun kecil, ex = proteksi profit di setelan live, "
@@ -307,8 +319,10 @@ def main() -> None:
     else:
         chosen = {"tf": TREND_VARIANTS, "mr": MR_VARIANTS, "os": OS_VARIANTS, "cf": CF_VARIANTS,
                   "dt": DT_VARIANTS, "sm": SM_VARIANTS, "dy": DY_VARIANTS, "ex": EX_VARIANTS,
-                  "dd": DD_VARIANTS, "xs": XS_VARIANTS}[args.family]
+                  "dd": DD_VARIANTS, "xs": XS_VARIANTS, "wr": WR_VARIANTS}[args.family]
         start, end, label = pd.Timestamp(args.start), split, "IN-SAMPLE"
+        if args.oos:
+            start, end, label = split, pd.Timestamp.max, "OUT-OF-SAMPLE"
 
     rows, pairs = {}, {}
     for name, overrides in chosen.items():

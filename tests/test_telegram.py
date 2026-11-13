@@ -95,7 +95,7 @@ class FakeAnalysisLLM:
 GOOD_SETUP = dict(symbol="EURUSD", side="BUY", entry_low=1.1990, entry_high=1.2010, stop_loss=1.1950,
                   take_profit_1=1.2110, take_profit_2=1.2200, confidence="High", reason="BOS naik", wait_for="pin bar",
                   invalid_if="close < 1.1950", valid_minutes=90,
-                  score=dict(trend=18, structure=18, key_level=12, price_action=16, momentum=12, rr=10))
+                  score=dict(trend=18, ema=8, momentum=8, structure=13, liquidity=12, price_action=13, location=9, rr=5))
 
 
 def test_analysis_button_sends_text_and_respects_cooldown(bot):

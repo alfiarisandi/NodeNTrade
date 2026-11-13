@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class SymbolCfg(BaseModel):
     name: str
     max_spread_points: float
+    max_lot: float = Field(0.0, ge=0)   # batas lot per order untuk simbol ini (0 = tanpa batas)
 
 
 class StrategyCfg(BaseModel):
@@ -69,6 +70,7 @@ class StrategyCfg(BaseModel):
     tp2_r: float = 0.0
     post_trail_atr_mult: float = 0.0
     post_swing_bars: int = 0
+    partial_keep_sl: bool = False   # sisa posisi tetap memakai SL awal (tanpa breakeven) setelah TP parsial
     # Filter konfirmasi tambahan (berlaku untuk entry_type apa pun; default nonaktif)
     ma_filter: bool = False       # buy hanya jika close > EMA(ema_trend) di timeframe entry, sell sebaliknya
     macd_filter: bool = False     # buy hanya jika MACD(12,26,9) > garis sinyal, sell sebaliknya
@@ -188,10 +190,21 @@ class ManageCfg(BaseModel):
     lock_r: float = Field(0.5, ge=0)
     partial_frac: float = Field(0.5, ge=0, lt=1)   # bagian lot yang ditutup di target parsial (0 = TP1 menutup semua)
     partial_at_r: float = Field(1.0, ge=0)   # target parsial dalam R (0 = di TP1 setup)
+    # Target parsial dalam uang: profit floating posisi >= $N (0 = nonaktif). Dipakai mana yang lebih dulu
+    # tercapai antara ini dan partial_at_r / TP1.
+    partial_at_usd: float = Field(0.0, ge=0)
     trail: Literal["atr", "swing", "none"] = "atr"   # trailing sisa posisi setelah TP1
     trail_tf: Literal["M5", "M15", "M30", "H1"] = "M15"
     trail_atr_mult: float = Field(1.5, gt=0)
     close_on_choch: bool = True              # setelah TP1: tutup sisa bila struktur trail_tf berbalik (CHoCH)
+
+
+class CandleReportCfg(BaseModel):
+    """Ringkasan teknikal singkat di setiap close candle `timeframe` (tanpa AI), juga saat tidak ada sinyal/setup."""
+    enabled: bool = False
+    timeframe: Literal["M15", "M30", "H1", "H4"] = "H1"
+    start_hour_wib: int = Field(8, ge=0, le=23)    # jam close candle (WIB) pertama yang dilaporkan
+    end_hour_wib: int = Field(23, ge=0, le=23)     # jam close candle (WIB) terakhir yang dilaporkan
 
 
 class Settings(BaseModel):
@@ -210,6 +223,7 @@ class Settings(BaseModel):
     confirm: ConfirmCfg = ConfirmCfg()
     manage: ManageCfg = ManageCfg()
     manage_symbols: dict[str, dict] = Field(default_factory=dict)   # override ManageCfg per simbol
+    candle_report: CandleReportCfg = CandleReportCfg()
     journal_path: str = "data/journal.db"
     data_dir: str = "data"
     reports_dir: str = "reports"

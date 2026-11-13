@@ -8,10 +8,12 @@ from bot.ai.prompts import DAILY_SYSTEM, WEEKLY_SYSTEM
 
 
 def daily_report(llm: LLM, date_str: str, account: dict, signals: list[dict], trades: list[dict],
-                 markets: dict[str, dict], ai_vs_rules: dict, calendar: list[dict] | None = None) -> str:
+                 markets: dict[str, dict], ai_vs_rules: dict, calendar: list[dict] | None = None,
+                 results: dict | None = None) -> str:
     payload = {
         "date_utc": date_str,
         "account": account,
+        "results_today_closed_trades": results or {"trades": 0},
         "signals_today": signals,
         "trades_today": trades,
         "market_by_symbol": markets,
