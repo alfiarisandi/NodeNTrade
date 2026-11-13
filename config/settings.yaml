@@ -13,8 +13,7 @@ symbol_suffix: ".m"   # MIFX / Monex-Demo
 # max_spread_points dalam satuan "point" broker (EURUSD 5 digit: 10 point = 1 pip).
 # Sesuaikan setelah melihat spread nyata di --check.
 symbols:
-  # max_lot: batas lot per order (0 / dihapus = tanpa batas). EURUSD maks 0.1 lot sejak 2026-11-13.
-  - {name: EURUSD, max_spread_points: 20, max_lot: 0.1}
+  - {name: EURUSD, max_spread_points: 20}
   # 11 pair diuji 2026-11-12: out-of-sample 2024-sekarang PF 0.89, DD 17% -> tetap 2 pair.
   - {name: XAUUSD, max_spread_points: 50}
 
@@ -78,23 +77,13 @@ ai:
   enabled: true
   on_failure: skip          # skip = lewati sinyal jika AI error | rule_only = tetap trade tanpa AI
   timeout_seconds: 180
-  max_tokens: 6000          # 4000: jawaban Opus sering terpotong (13/11: 4x pindah ke cadangan); + daftar pantauan
+  max_tokens: 6000          # kemarin 4000; dinaikkan agar jawaban Opus tidak terpotong (tidak mengubah logika trading)
   daily_review_hour_utc: 21
   weekly_review_weekday: 4      # laporan mingguan tiap Jumat (UTC) ...
   weekly_review_hour_utc: 21    # ... pukul 21:00 UTC = Sabtu 04:00 WIB
   # Analisis XAUUSD & EURUSD otomatis (sama seperti tombol 📊 Analisis) di jam WIB ini, Senin-Jumat.
   # Kosong = hanya saat tombol ditekan. Contoh: [14, 20] = jelang buka London & New York.
-  # 2026-11-13: tiap jam sesi London-New York (London buka 15:00 WIB saat musim dingin Eropa, 14:00 saat musim
-  # panas; New York buka 20:00 / 19:00 WIB). Setup tetap lewat konfirmasi pemilik, kuota confirm.max_setups_per_day.
-  analysis_hours_wib: [15, 16, 17, 18, 19, 20, 21, 22, 23]
-  # Jawaban WAIT sering memuat skenario "tunggu" (close M15 di bawah X, rejection di zona Y). Bot memantau tiap
-  # close M15 di rentang jam analysis_hours_wib dan memanggil analisis ulang saat pemicunya kena.
-  # Screener M15 (2026-11-13): tiap candle M15 close di jam yang sama, bot menjalankan aturan strategi A-E sesuai
-  # regime (bot.intraday, sama dengan backtest) tanpa AI. Ada kandidat = AI dipanggil menilai; pair + arah yang sama
-  # tidak dikirim ulang dalam 60 menit. Aturan A-E sendiri tidak terbukti punya edge: ini penyaring, AI yang menilai.
-  screener: true
-  # Batas analisis di luar jadwal per jam (pemicu pantauan + screener) per hari WIB (0 = pantauan nonaktif).
-  max_trigger_analyses_per_day: 12
+  analysis_hours_wib: []
   # Model cadangan bila model utama (AI_MODEL di .env) kena limit / error, dicoba berurutan. Nama persis di 9Router.
   # Diuji 2026-11-12 dengan snapshot analisis yang sama dengan Opus:
   # - cc/claude-sonnet-5-5: valid, 23 dtk, setup mirip Opus (tapi satu akun dengan Opus: ikut mati bila limit akun habis)
@@ -117,10 +106,9 @@ news:
   block_impacts: [High]
   block_before_hours: 4     # tidak entry jika ada event High untuk mata uang pair ini dalam 4 jam ke depan
   block_after_hours: 1      # ... atau event itu baru lewat kurang dari 1 jam
-  # Setup 📊 Analisis (day trade) memakai jendela lebih pendek. 4 jam memblok seluruh sesi London di hari berita USD
-  # (13/11: PPI 20:30 WIB memblok kedua pair 16:30-21:30). Order limit setup juga dibatalkan di jendela ini.
-  setup_block_before_hours: 1
-  setup_block_after_hours: 0.5
+  # Branch uji/setelan-kemarin: setup 📊 Analisis memakai jendela yang sama seperti kemarin (4 jam / 1 jam)
+  setup_block_before_hours: 4
+  setup_block_after_hours: 1
   context_days: 5           # event High/Medium 5 hari ke depan diberikan ke Claude
   refresh_minutes: 180
 
@@ -142,22 +130,12 @@ manage:
   partial_frac: 0.5     # tutup 50% lot di target parsial (butuh lot >= 2x lot minimum; kalau tidak, TP1 menutup semua)
   partial_at_r: 1.0     # target parsial = +1R (0 = di TP1). Backtest xs: parsial di 1R menaikkan win rate ~36% -> ~48-51%
                         # dengan profit factor hampir sama; parsial di 0.5R / TP dekat menaikkan win rate tapi merugi
-  partial_at_usd: 10    # ... atau saat profit floating posisi >= $10, mana yang lebih dulu (0 = nonaktif). Skema pemilik
-                        # 2026-11-13: kunci separuh di $10, sisa jalan ke TP1/TP2 dengan SL breakeven. Belum di-backtest.
   trail: atr            # sisa posisi setelah TP1: atr | swing | none
   trail_tf: M15
   trail_atr_mult: 1.5
   close_on_choch: true  # setelah TP1, tutup sisa bila struktur M15 berbalik (CHoCH)
 manage_symbols:         # override per pair
   EURUSD: {trail: swing}
-
-# Ringkasan teknikal di setiap close candle (tanpa AI, tidak memakai kuota), juga saat belum ada sinyal / setup:
-# regime, bias H4/H1, harga vs VWAP, RSI & Bollinger H1, status sinyal Ichimoku H4, posisi & order limit.
-candle_report:
-  enabled: true
-  timeframe: H1         # M15 | M30 | H1 | H4
-  start_hour_wib: 8     # candle yang close 08:00-23:00 WIB
-  end_hour_wib: 23
 
 journal_path: data/journal.db
 data_dir: data

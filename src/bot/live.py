@@ -870,7 +870,8 @@ class LiveBot:
         ctx = build_analysis_context(per_symbol, self.s.strategy, self.meta, spreads, now, self.offset,
                                      self.calendar if self.calendar and self.calendar.available else None,
                                      {"equity": round(acc.equity, 2), "balance": round(acc.balance, 2),
-                                      "currency": acc.currency}, positions, recent, rules, prices)
+                                      "currency": acc.currency}, positions, recent, rules, prices,
+                                     with_intraday=False)   # branch uji/setelan-kemarin: snapshot seperti 12/11
         return analyze_market(self.llm, ctx)
 
     def setup_checks(self, analysis: Analysis) -> list[tuple]:

@@ -285,9 +285,11 @@ def build_analysis_context(per_symbol: dict[str, dict[str, pd.DataFrame]], p: St
                            spreads: dict[str, float], now: datetime, offset_hours: int = 0, calendar=None,
                            account: dict | None = None, positions: list[dict] | None = None,
                            recent_trades: list[dict] | None = None, rules: dict | None = None,
-                           prices: dict[str, dict] | None = None, pending_orders: list[dict] | None = None) -> str:
+                           prices: dict[str, dict] | None = None, pending_orders: list[dict] | None = None,
+                           with_intraday: bool = True) -> str:
     """Snapshot multi-timeframe semua pair untuk analisis harian Claude (tanpa kandidat sinyal).
     pending_orders = order limit setup yang masih menunggu (hanya diisi saat cek posisi).
+    with_intraday=False: tanpa snapshot regime/VWAP/SMC (seperti analisis 12/11, branch uji/setelan-kemarin).
     per_symbol = {symbol: {"H4": df, "H1": df, "M15": df, "M5": df}} (frame kosong boleh dihilangkan)."""
     symbols = {}
     for sym, frames in per_symbol.items():
@@ -298,7 +300,7 @@ def build_analysis_context(per_symbol: dict[str, dict[str, pd.DataFrame]], p: St
             "price_now": {k: _r(v, digits) for k, v in (prices or {}).get(sym, {}).items()},
             "spread_points": _r(spreads.get(sym), 1),
             "market": market_summary({tf: frames[tf] for tf in ("H4", "H1", "M15") if tf in frames}, p, digits),
-            "intraday": intraday_snapshot(frames, digits),
+            **({"intraday": intraday_snapshot(frames, digits)} if with_intraday else {}),
             "key_levels": key_levels(frames, p, digits, offset_hours, now),
             "structure": {tf: market_structure(frames[tf], digits) for tf in ("H1", "M15") if tf in frames},
             "candles": {tf: candle_patterns(frames[tf], digits) for tf in ("H1", "M15") if tf in frames},

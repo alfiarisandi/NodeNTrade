@@ -10,12 +10,15 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from bot.ai.client import LLM
 from bot.ai.prompts import ANALYSIS_SYSTEM, POSITION_SYSTEM
-from bot.intraday import SCORE_WEIGHTS, STRATEGIES
+from bot.intraday import STRATEGIES
 
 MIN_RR = 1.5              # minimal reward:risk TP1 (ideal 2+)
-MIN_SCORE = 65            # skor setup di bawah ini = WAIT / NO TRADE
-VALID_SCORE = 75          # 65-74 = conditional: hanya opsi risiko terkecil
-FULL_RISK_SCORE = 85      # premium; 75-84 = valid: hanya boleh risiko <= risk_per_trade
+# Branch uji/setelan-kemarin: skor & ambang seperti commit e451a9c (12/11): 70-79 = risiko <= risk_per_trade,
+# >= 80 = semua opsi risiko, < 70 = WAIT. Tidak ada tingkat "conditional".
+MIN_SCORE = 70            # skor setup di bawah ini = WAIT
+VALID_SCORE = 70
+FULL_RISK_SCORE = 80      # di bawah ini hanya boleh risiko <= risk_per_trade
+SCORE_WEIGHTS = {"trend": 20, "structure": 20, "key_level": 15, "price_action": 20, "momentum": 15, "rr": 10}
 MAX_COST_R = 0.15         # spread + komisi maksimal 15% dari R: SL lebih sempit dari itu tidak layak
 SL_ATR_RANGE = (0.3, 3.0)     # jarak SL dalam ATR H1 yang masuk akal untuk day trade
 MAX_ZONE_ATR = 1.0            # zona entry lebih lebar dari 1 ATR H1 = bukan zona

@@ -92,7 +92,7 @@ def make_setup(price, **kw):
     base = dict(symbol="EURUSD", side="BUY", entry_low=price - 0.0005, entry_high=price + 0.0005,
                 stop_loss=price - 0.0040, take_profit_1=price + 0.0100, take_profit_2=price + 0.0150,
                 confidence="High", reason="BOS naik", valid_minutes=60,
-                score=dict(trend=18, ema=8, momentum=8, structure=13, liquidity=12, price_action=13, location=9, rr=5))
+                score=dict(trend=18, structure=18, key_level=13, price_action=17, momentum=12, rr=8))
     base.update(kw)
     return Setup(**base)
 

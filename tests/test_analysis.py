@@ -13,7 +13,7 @@ from conftest import resample_h4
 def setup(**kw):
     base = dict(symbol="xauusd", side="BUY", entry_low=2000.0, entry_high=2002.0, stop_loss=1995.0,
                 take_profit_1=2013.0, take_profit_2=2020.0, confidence="High", reason="r", wait_for="w", invalid_if="i",
-                score=dict(trend=18, ema=8, momentum=8, structure=13, liquidity=12, price_action=13, location=9, rr=5))
+                score=dict(trend=18, structure=18, key_level=13, price_action=17, momentum=12, rr=8))
     base.update(kw)
     return Setup(**base)
 
@@ -100,13 +100,13 @@ def test_analysis_context_structure(uptrend_waves, settings, eurusd_meta):
 
 def test_score_and_cost_limits():
     atr = 4.0
-    low = setup(score=dict(trend=20, ema=10, momentum=10, structure=15, liquidity=0, price_action=0, location=5, rr=0))
-    assert low.score_total == 60 and "skor 60/100 < 65" in validate_setup(low, atr) and low.grade == "No Trade"
-    capped = setup(score=dict(trend=99, ema=10, momentum=10, structure=15, liquidity=15, price_action=15,
-                              location=10, rr=5, bonus=50))
+    # bobot & ambang 12/11 (branch uji/setelan-kemarin): < 70 WAIT, 70-79 Valid, >= 80 Premium
+    low = setup(score=dict(trend=20, structure=20, key_level=15, price_action=0, momentum=10, rr=0))
+    assert low.score_total == 65 and "skor 65/100 < 70" in validate_setup(low, atr) and low.grade == "No Trade"
+    capped = setup(score=dict(trend=99, structure=20, key_level=15, price_action=20, momentum=15, rr=10, bonus=50))
     assert capped.score_total == 100                                   # tiap komponen dibatasi bobotnya
-    cond = setup(score=dict(trend=20, ema=10, momentum=10, structure=15, liquidity=0, price_action=10, location=5))
-    assert (cond.score_total, cond.grade) == (70, "Conditional") and validate_setup(cond, atr) is None
+    ok = setup(score=dict(trend=20, structure=20, key_level=15, price_action=0, momentum=15))
+    assert (ok.score_total, ok.grade) == (70, "Valid") and validate_setup(ok, atr) is None
     labeled = setup(strategy="b", regime="trend")
     assert (labeled.strategy, labeled.regime) == ("B", "TREND") and setup(strategy="zzz").strategy == ""
     assert "strategi B Smart Money Concepts" in format_setup(labeled, 2)
