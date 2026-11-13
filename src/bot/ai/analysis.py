@@ -6,7 +6,7 @@ import json
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from bot.ai.client import LLM
 from bot.ai.prompts import ANALYSIS_SYSTEM, POSITION_SYSTEM
@@ -83,9 +83,63 @@ class Setup(BaseModel):
         return self.entry_low - tolerance <= price <= self.entry_high + tolerance
 
 
+class Watch(BaseModel):
+    """Skenario "tunggu" dari jawaban WAIT: bot memantau close M15 dan memanggil analisis ulang saat pemicu kena.
+    close_below / close_above: close M15 melewati `level`; zone: candle M15 menyentuh zona_low-zone_high."""
+    symbol: str
+    side: Literal["BUY", "SELL"]
+    trigger: Literal["close_below", "close_above", "zone"]
+    level: float | None = None
+    zone_low: float | None = None
+    zone_high: float | None = None
+    invalid_level: float | None = None   # close M15 melewati level ini (melawan arah side) = skenario batal
+    valid_minutes: int = Field(240, ge=15, le=480)
+    strategy: str = ""
+    note: str = ""
+
+    def model_post_init(self, __context) -> None:
+        self.symbol = self.symbol.upper().strip()
+        self.strategy = self.strategy.upper().strip()[:1]
+        if self.strategy not in STRATEGIES:
+            self.strategy = ""
+        if self.zone_low is not None and self.zone_high is not None and self.zone_low > self.zone_high:
+            self.zone_low, self.zone_high = self.zone_high, self.zone_low
+
+    @property
+    def direction(self) -> int:
+        return 1 if self.side == "BUY" else -1
+
+    def triggered(self, bar_high: float, bar_low: float, bar_close: float) -> bool:
+        """Pemicu terpenuhi oleh candle M15 yang sudah close."""
+        if self.trigger == "close_below":
+            return bar_close < self.level
+        if self.trigger == "close_above":
+            return bar_close > self.level
+        return bar_high >= self.zone_low and bar_low <= self.zone_high
+
+    def invalidated(self, bar_close: float) -> bool:
+        """Close M15 melewati level pembatal: BUY batal bila close di bawahnya, SELL bila di atasnya."""
+        if self.invalid_level is None:
+            return False
+        return bar_close < self.invalid_level if self.direction == 1 else bar_close > self.invalid_level
+
+
 class Analysis(BaseModel):
     text: str
     setups: list[Setup] = Field(default_factory=list)
+    watch: list[Watch] = Field(default_factory=list)
+
+    @field_validator("watch", mode="before")
+    @classmethod
+    def _drop_bad_watch(cls, v):
+        """Item pantauan yang rusak dibuang satu per satu, jangan menggagalkan seluruh analisis."""
+        out = []
+        for item in v or []:
+            try:
+                out.append(Watch.model_validate(item))
+            except ValidationError:
+                continue
+        return out
 
 
 def parse_analysis(text: str) -> Analysis:
@@ -96,16 +150,17 @@ def parse_analysis(text: str) -> Analysis:
     return Analysis.model_validate(json.loads(m.group(0)))
 
 
-def validate_setup(s: Setup, atr: float, cost: float = 0.0) -> str | None:
+def validate_setup(s: Setup, atr: float, cost: float = 0.0, check_score: bool = True) -> str | None:
     """Alasan setup tidak boleh dieksekusi, atau None jika lolos batas keras. atr = ATR H1 simbol,
-    cost = spread + komisi round-turn dalam satuan harga."""
+    cost = spread + komisi round-turn dalam satuan harga. check_score=False untuk setup yang sudah disetujui
+    pemilik (mis. order limit yang dipindah), sehingga hanya batas harga yang dicek."""
     if s.sl_distance <= 0:
         return "SL di sisi yang salah"
     if s.tp_distance <= 0:
         return "TP1 di sisi yang salah"
     if s.rr < MIN_RR - 1e-9:
         return f"RR {s.rr:.1f} < {MIN_RR:g}"
-    if s.score_total < MIN_SCORE:
+    if check_score and s.score_total < MIN_SCORE:
         return f"skor {s.score_total}/100 < {MIN_SCORE} (WAIT)"
     if cost > 0 and cost / s.sl_distance > MAX_COST_R:
         return (f"biaya {cost / s.sl_distance:.0%} dari R, batas {MAX_COST_R:.0%}: SL terlalu sempit untuk "
@@ -117,6 +172,34 @@ def validate_setup(s: Setup, atr: float, cost: float = 0.0) -> str | None:
         if s.entry_high - s.entry_low > MAX_ZONE_ATR * atr:
             return f"zona entry terlalu lebar ({(s.entry_high - s.entry_low) / atr:.1f} ATR)"
     return None
+
+
+def watch_problem(w: Watch, price: float) -> str | None:
+    """Alasan item pantauan tidak dipakai, atau None jika masuk akal terhadap harga sekarang."""
+    if w.trigger == "zone":
+        if w.zone_low is None or w.zone_high is None:
+            return "zona tidak lengkap"
+        if w.zone_low <= price <= w.zone_high:
+            return "harga sudah di zona"
+    elif w.level is None:
+        return "level pemicu kosong"
+    elif (w.trigger == "close_below") == (price < w.level):
+        return "pemicu sudah terpenuhi di harga sekarang"
+    if w.invalidated(price):
+        return "harga sudah melewati level pembatal"
+    return None
+
+
+def format_watch(w: Watch, digits: int) -> str:
+    f = f".{digits}f"
+    if w.trigger == "zone":
+        what = f"candle M15 menyentuh {w.zone_low:{f}}-{w.zone_high:{f}}"
+    else:
+        what = f"close M15 {'di bawah' if w.trigger == 'close_below' else 'di atas'} {w.level:{f}}"
+    label = f" ({w.strategy})" if w.strategy else ""
+    inv = f", batal bila close {'di bawah' if w.direction == 1 else 'di atas'} {w.invalid_level:{f}}" \
+        if w.invalid_level is not None else ""
+    return f"{w.side} {w.symbol}{label}: {what}{inv}"
 
 
 def analyze_market(llm: LLM, context_json: str, system: str = ANALYSIS_SYSTEM) -> Analysis:
@@ -153,14 +236,25 @@ class Advice(BaseModel):
     reverse_scenario: str = ""
 
 
+class LimitAdvice(BaseModel):
+    """Saran untuk order limit yang masih menunggu: KEEP (biarkan), MOVE (pindah entry/SL/TP), CANCEL."""
+    ticket: int
+    action: Literal["KEEP", "MOVE", "CANCEL"]
+    new_price: float | None = None
+    new_sl: float | None = None
+    new_tp: float | None = None
+    reason: str = ""
+
+
 class PositionReview(BaseModel):
     text: str = ""
     advice: list[Advice] = Field(default_factory=list)
+    limit_advice: list[LimitAdvice] = Field(default_factory=list)
 
 
 def review_positions(llm: LLM, context_json: str, system: str = POSITION_SYSTEM) -> PositionReview:
     """Saran pengelolaan posisi terbuka. Raise LLMError / ValueError jika gagal atau jawaban tidak valid."""
-    raw = llm.complete(system, f"Market snapshot and open positions (JSON):\n{context_json}")
+    raw = llm.complete(system, f"Market snapshot, open positions and pending limit orders (JSON):\n{context_json}")
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
         raise ValueError("tidak ada JSON di jawaban")

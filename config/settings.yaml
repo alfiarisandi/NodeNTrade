@@ -78,13 +78,23 @@ ai:
   enabled: true
   on_failure: skip          # skip = lewati sinyal jika AI error | rule_only = tetap trade tanpa AI
   timeout_seconds: 180
-  max_tokens: 4000
+  max_tokens: 6000          # 4000: jawaban Opus sering terpotong (13/11: 4x pindah ke cadangan); + daftar pantauan
   daily_review_hour_utc: 21
   weekly_review_weekday: 4      # laporan mingguan tiap Jumat (UTC) ...
   weekly_review_hour_utc: 21    # ... pukul 21:00 UTC = Sabtu 04:00 WIB
   # Analisis XAUUSD & EURUSD otomatis (sama seperti tombol 📊 Analisis) di jam WIB ini, Senin-Jumat.
   # Kosong = hanya saat tombol ditekan. Contoh: [14, 20] = jelang buka London & New York.
-  analysis_hours_wib: []
+  # 2026-11-13: tiap jam sesi London-New York (London buka 15:00 WIB saat musim dingin Eropa, 14:00 saat musim
+  # panas; New York buka 20:00 / 19:00 WIB). Setup tetap lewat konfirmasi pemilik, kuota confirm.max_setups_per_day.
+  analysis_hours_wib: [15, 16, 17, 18, 19, 20, 21, 22, 23]
+  # Jawaban WAIT sering memuat skenario "tunggu" (close M15 di bawah X, rejection di zona Y). Bot memantau tiap
+  # close M15 di rentang jam analysis_hours_wib dan memanggil analisis ulang saat pemicunya kena.
+  # Screener M15 (2026-11-13): tiap candle M15 close di jam yang sama, bot menjalankan aturan strategi A-E sesuai
+  # regime (bot.intraday, sama dengan backtest) tanpa AI. Ada kandidat = AI dipanggil menilai; pair + arah yang sama
+  # tidak dikirim ulang dalam 60 menit. Aturan A-E sendiri tidak terbukti punya edge: ini penyaring, AI yang menilai.
+  screener: true
+  # Batas analisis di luar jadwal per jam (pemicu pantauan + screener) per hari WIB (0 = pantauan nonaktif).
+  max_trigger_analyses_per_day: 12
   # Model cadangan bila model utama (AI_MODEL di .env) kena limit / error, dicoba berurutan. Nama persis di 9Router.
   # Diuji 2026-11-12 dengan snapshot analisis yang sama dengan Opus:
   # - cc/claude-sonnet-5-5: valid, 23 dtk, setup mirip Opus (tapi satu akun dengan Opus: ikut mati bila limit akun habis)
@@ -107,6 +117,10 @@ news:
   block_impacts: [High]
   block_before_hours: 4     # tidak entry jika ada event High untuk mata uang pair ini dalam 4 jam ke depan
   block_after_hours: 1      # ... atau event itu baru lewat kurang dari 1 jam
+  # Setup 📊 Analisis (day trade) memakai jendela lebih pendek. 4 jam memblok seluruh sesi London di hari berita USD
+  # (13/11: PPI 20:30 WIB memblok kedua pair 16:30-21:30). Order limit setup juga dibatalkan di jendela ini.
+  setup_block_before_hours: 1
+  setup_block_after_hours: 0.5
   context_days: 5           # event High/Medium 5 hari ke depan diberikan ke Claude
   refresh_minutes: 180
 

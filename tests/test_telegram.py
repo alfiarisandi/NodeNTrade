@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 import requests
 
@@ -251,6 +252,250 @@ def test_position_review_buttons_and_guards(bot):
     assert bot.mt5.sl_moves == [(5, 1.05)] and "Tidak diterapkan" in bot.notifier.answers[-1]
     click(bot, "pa:5:pc:0.05")
     assert bot.mt5.partials == [(5, 0.05)]
+
+
+class FakeLimitLLM:
+    def __init__(self, limit_advice):
+        self.reply = json.dumps({"text": "ringkasan", "advice": [], "limit_advice": limit_advice})
+        self.snap = None
+
+    def complete(self, system, user):
+        self.snap = json.loads(user.split("\n", 1)[1])
+        return self.reply
+
+
+def add_sell_limit(bot, price, ticket=801):   # FakeMT5 memberi tiket 901+ untuk limit baru
+    """Order limit SELL dari setup 📊 yang sedang menunggu: SL +30 pip, TP -60 pip, risiko 0.5%."""
+    setup = dict(symbol="EURUSD", side="SELL", entry_low=price, entry_high=price, stop_loss=price + 0.0030,
+                 take_profit_1=price - 0.0060, take_profit_2=price - 0.0090, reason="supply H1", valid_minutes=120,
+                 score=dict(trend=18, ema=8, momentum=8, structure=13, liquidity=12, price_action=13, location=9, rr=5))
+    sid = bot.journal.log_signal("EURUSD", -1, f"setup {ticket}", price, 0.0030, 0.0060, {}, source="ai_setup",
+                                 setup=setup)
+    expires = datetime.now(timezone.utc).replace(microsecond=0) + __import__("datetime").timedelta(hours=1)
+    bot.journal.update_signal(sid, user_decision="limit", user_risk=0.005, limit_ticket=ticket,
+                              limit_expires=expires.isoformat())
+    bot.mt5.pending.append(SimpleNamespace(ticket=ticket, magic=bot.s.magic, volume_current=0.16))
+    return sid
+
+
+def test_limit_review_move_cancel_and_guards(bot):
+    bid = bot.mt5.tick("EURUSD").bid
+    sid = add_sell_limit(bot, round(bid + 0.0020, 5))
+    p1 = round(bid + 0.0025, 5)
+    bot.llm = FakeLimitLLM([
+        {"ticket": 801, "action": "MOVE", "new_price": p1, "new_sl": p1 + 0.0030, "new_tp": p1 - 0.0060, "reason": "supply baru"},
+        {"ticket": 801, "action": "MOVE", "new_price": bid - 0.0010, "new_sl": bid + 0.0020, "new_tp": bid - 0.0080,
+         "reason": "kejar harga"},                                             # ditolak: SELL limit di bawah bid
+        {"ticket": 801, "action": "MOVE", "new_price": p1, "new_sl": p1 + 0.0030, "new_tp": p1 - 0.0020,
+         "reason": "TP dekat"},                                                # ditolak: RR < 1.5
+        {"ticket": 801, "action": "CANCEL", "reason": "struktur patah"},
+        {"ticket": 801, "action": "KEEP", "reason": "level masih valid"},
+        {"ticket": 999, "action": "CANCEL", "reason": "tiket tidak ada"},
+    ])
+    say(bot, "🩺 Posisi AI")
+    lim = bot.llm.snap["pending_limit_orders"]
+    assert [x["ticket"] for x in lim] == [801] and lim[0]["side"] == "SELL" and lim[0]["reward_risk"] == 2.0
+    assert "1 posisi dan 1 order limit" in " ".join(bot.notifier.msgs)
+    datas = [row[0][0][1] for row in bot.notifier.buttons]
+    assert len(datas) == 2 and datas[0].startswith(f"la:801:mv:{p1:.5f}:") and datas[1].startswith("la:801:cx:")
+    assert sum("tidak bisa diterapkan" in m for m in bot.notifier.msgs) == 2
+    assert any(m.startswith("🩺 KEEP | LIMIT SELL EURUSD") for m in bot.notifier.msgs)
+
+    click(bot, datas[0])                                    # pindahkan: limit lama batal, baru dipasang
+    _, d, vol, price, sl, tp = bot.mt5.limits[-1]
+    assert (d, price) == (-1, p1) and sl == pytest.approx(p1 + 0.0030) and tp == pytest.approx(p1 - 0.0060)
+    assert vol == pytest.approx(0.16)                       # risiko 0.5% dari $10k / 30 pip, tidak bertambah
+    row = bot.journal.get_signal(sid)
+    assert row["limit_ticket"] == 901
+    assert [o.ticket for o in bot.mt5.pending] == [row["limit_ticket"]]
+    assert json.loads(row["setup"])["take_profit_1"] == pytest.approx(p1 - 0.0060) and "dipindah" in bot.notifier.msgs[-1]
+
+    click(bot, datas[1])                                    # tombol batal untuk tiket lama: sudah tidak ada
+    assert "sudah tidak ada" in bot.notifier.answers[-1] and len(bot.mt5.pending) == 1
+    new = row["limit_ticket"]
+    click(bot, f"la:{new}:cx:{int(time.time()) - 3600}")    # tombol kedaluwarsa
+    assert "kedaluwarsa" in bot.notifier.answers[-1] and len(bot.mt5.pending) == 1
+    click(bot, f"la:{new}:cx:{int(time.time())}")
+    assert bot.mt5.pending == [] and bot.journal.get_signal(sid)["user_decision"] == "limit_cancelled"
+
+
+def test_review_with_only_limit_and_nothing(bot):
+    bot.mt5.open_positions.clear()
+    say(bot, "🩺 Posisi AI")
+    assert "Tidak ada posisi terbuka atau order limit" in bot.notifier.msgs[-1]
+    add_sell_limit(bot, round(bot.mt5.tick("EURUSD").bid + 0.0020, 5))
+    bot.llm = FakeLimitLLM([{"ticket": 801, "action": "KEEP", "reason": "ok"}])
+    say(bot, "🩺 Posisi AI")
+    assert bot.llm.snap["open_positions"] == [] and len(bot.llm.snap["pending_limit_orders"]) == 1
+    assert "1 order limit" in " ".join(bot.notifier.msgs)
+
+
+class FakeWatchLLM:
+    """Selalu WAIT dengan daftar pantauan yang sama; mencatat snapshot tiap panggilan."""
+    def __init__(self, watch):
+        self.snaps, self.watch = [], watch
+
+    @property
+    def calls(self):
+        return len(self.snaps)
+
+    def complete(self, system, user):
+        self.snaps.append(json.loads(user.split("\n", 1)[1]))
+        return json.dumps({"text": "WAIT / NO TRADE", "setups": [], "watch": self.watch})
+
+
+WED_15_WIB = datetime(2026, 1, 14, 8, 5, tzinfo=timezone.utc)
+
+
+def watch_setup(bot, tsettings, watch, cap=6):
+    bot.s = tsettings.model_copy(update={"ai": tsettings.ai.model_copy(update={
+        "analysis_hours_wib": [15, 16], "max_trigger_analyses_per_day": cap})})
+    bot.mt5.open_positions.clear()
+    bot.llm = FakeWatchLLM(watch)
+    say(bot, "📊 Analisis")
+    bot.journal.set_state("analysis_last_ts", "0")
+    # pantauan dibuat 07:45 UTC (15 menit sebelum candle uji pertama close); expires tetap dari jam sekarang
+    bot.journal.set_state("watchlist", json.dumps([dict(it, created="2026-01-14T07:45:00+00:00")
+                                                   for it in bot.watchlist()]))
+
+
+def m15_bar(bot, minute, close, high=None, low=None):
+    """Ganti data M15 FakeMT5: candle terakhir yang sudah close, mulai 08:00 UTC + `minute` (offset 0)."""
+    t = pd.Timestamp("2026-01-14 08:00") + pd.Timedelta(minutes=minute)
+    df = pd.DataFrame({"time": [t], "open": [close], "high": [high or close], "low": [low or close],
+                       "close": [close]})
+    orig = type(bot.mt5).rates
+    bot.mt5.rates = lambda s, tf, n: df if tf == "M15" else orig(bot.mt5, s, tf, n)
+
+
+def test_watch_trigger_reanalyses_once(bot, tsettings):
+    p = bot.mt5.tick("EURUSD").bid
+    watch_setup(bot, tsettings, [
+        dict(symbol="EURUSD", side="BUY", trigger="close_above", level=round(p + 0.0020, 5),
+             invalid_level=round(p - 0.0030, 5), strategy="D", note="retest"),
+        dict(symbol="EURUSD", side="BUY", trigger="close_above", level=round(p - 0.0010, 5)),   # sudah terpenuhi
+        dict(symbol="XAUUSD", side="SELL", trigger="close_below", level=3888.4)])            # pair tidak diperdagangkan
+    assert "👀 Dipantau" in bot.notifier.msgs[-1] and len(bot.watchlist()) == 1
+    m15_bar(bot, -30, p + 0.0025)                     # close 07:45, sebelum/saat pantauan dibuat: diabaikan
+    bot.maybe_watch_triggers(WED_15_WIB)
+    assert bot.llm.calls == 1 and len(bot.watchlist()) == 1
+    m15_bar(bot, 0, p + 0.0010)                       # belum menembus level
+    bot.maybe_watch_triggers(WED_15_WIB)
+    assert bot.llm.calls == 1 and len(bot.watchlist()) == 1
+    m15_bar(bot, 15, p + 0.0025, high=p + 0.0030)     # close di atas level -> analisis ulang
+    bot.maybe_watch_triggers(WED_15_WIB)
+    bot.maybe_watch_triggers(WED_15_WIB)              # candle sama tidak dicek dua kali
+    assert bot.llm.calls == 2
+    assert any(m.startswith("🎯 Pemicu kena: BUY EURUSD (D)") for m in bot.notifier.msgs)
+    trig = bot.llm.snaps[-1]["owner_rules"]["triggered_by"]
+    assert trig["trigger"] == "close_above" and trig["fired"]["close"] == round(p + 0.0025, 5)
+    assert "1h before" in bot.llm.snaps[-1]["owner_rules"]["news_block_for_setups"]
+    assert bot.journal.get_state("trigger_count:2026-01-14") == "1"
+    assert len(bot.watchlist()) == 1   # analisis baru mengganti pantauan
+
+
+def test_watch_invalid_expired_and_outside_hours(bot, tsettings):
+    p = bot.mt5.tick("EURUSD").bid
+    item = dict(symbol="EURUSD", side="BUY", trigger="close_above", level=round(p + 0.0020, 5),
+                invalid_level=round(p - 0.0030, 5))
+    watch_setup(bot, tsettings, [item])
+    m15_bar(bot, 0, p + 0.0025)
+    bot.maybe_watch_triggers(datetime(2026, 1, 14, 2, 0, tzinfo=timezone.utc))   # 09 WIB: di luar jam
+    assert bot.llm.calls == 1 and len(bot.watchlist()) == 1
+    m15_bar(bot, 15, p - 0.0040)                     # close di bawah pembatal
+    bot.maybe_watch_triggers(WED_15_WIB)
+    assert bot.llm.calls == 1 and bot.watchlist() == []
+    bot.journal.set_state("watchlist", json.dumps([dict(item, id="x", created="2026-01-14T07:00:00+00:00",
+                                                        expires="2026-01-14T08:00:00+00:00")]))
+    m15_bar(bot, 30, p + 0.0025)
+    bot.maybe_watch_triggers(WED_15_WIB)              # kedaluwarsa 08:00 UTC
+    assert bot.llm.calls == 1 and bot.watchlist() == []
+
+
+def test_watch_held_by_cooldown_pause_and_daily_cap(bot, tsettings):
+    p = bot.mt5.tick("EURUSD").bid
+    watch_setup(bot, tsettings, [dict(symbol="EURUSD", side="BUY", trigger="close_above",
+                                      level=round(p + 0.0020, 5))], cap=1)
+    bot.journal.set_state("analysis_last_ts", f"{time.time():.0f}")   # cooldown aktif
+    m15_bar(bot, 0, p + 0.0025)
+    bot.maybe_watch_triggers(WED_15_WIB)
+    bot.maybe_watch_triggers(WED_15_WIB)              # siklus berikut, masih cooldown: tanpa pesan berulang
+    assert bot.llm.calls == 1 and len(bot.watchlist()) == 1
+    assert not any("🎯" in m or "Coba lagi" in m for m in bot.notifier.msgs)
+    bot.journal.set_state("analysis_last_ts", "0")
+    say(bot, "/pause")
+    bot.maybe_watch_triggers(WED_15_WIB)              # cooldown lewat, tapi entry dijeda
+    assert bot.llm.calls == 1 and len(bot.watchlist()) == 1
+    say(bot, "/resume")
+    m15_bar(bot, 15, p + 0.0025)
+    bot.maybe_watch_triggers(WED_15_WIB)
+    assert bot.llm.calls == 2
+    bot.journal.set_state("analysis_last_ts", "0")
+    m15_bar(bot, 30, p + 0.0025)
+    bot.maybe_watch_triggers(WED_15_WIB)              # batas 1 analisis pemicu/hari
+    assert bot.llm.calls == 2 and len(bot.watchlist()) == 1
+
+
+def screener_setup(bot, tsettings, cands, minute=0):
+    bot.s = tsettings.model_copy(update={"ai": tsettings.ai.model_copy(update={
+        "analysis_hours_wib": [15, 16], "screener": True, "max_trigger_analyses_per_day": 2})})
+    bot.mt5.open_positions.clear()
+    bot.llm = FakeWatchLLM([])
+    p = bot.mt5.tick("EURUSD").bid
+    m15_bar(bot, minute, p)
+    bar = bot.mt5.rates("EURUSD", "M15", 1).iloc[-1]
+    bot.screen_candidates = lambda sym: (bar, [dict(c, symbol=sym) for c in cands])
+
+
+SELL_C = dict(side="SELL", strategy="C", regime="TREND", rule_stop_ref=1.2345)
+
+
+def test_screener_calls_ai_on_candidate_once(bot, tsettings):
+    screener_setup(bot, tsettings, [SELL_C, dict(SELL_C, side="BUY", strategy="E")])
+    bot.maybe_screener(WED_15_WIB)
+    bot.maybe_screener(WED_15_WIB)                    # candle sama: tidak dicek ulang
+    assert bot.llm.calls == 1
+    assert any(m.startswith("🔎 Screener M15 15:15 WIB: kandidat SELL EURUSD strategi C VWAP + EMA") for m in bot.notifier.msgs)
+    trig = bot.llm.snaps[-1]["owner_rules"]["triggered_by"]
+    assert trig["source"] == "screener" and trig["rule_stop_ref"] == 1.2345 and trig["other_candidates"][0]["side"] == "BUY"
+    bot.journal.set_state("analysis_last_ts", "0")
+    m15_bar(bot, 15, bot.mt5.tick("EURUSD").bid)    # candle baru, pair + arah sama < 60 menit: tidak dikirim lagi
+    bot.maybe_screener(WED_15_WIB)
+    assert bot.llm.calls == 1
+
+
+def test_screener_skips_seen_bar_cooldown_and_blocks(bot, tsettings):
+    screener_setup(bot, tsettings, [SELL_C])
+    bot.journal.set_state("analysis_last_ts", f"{time.time():.0f}")   # analisis terjadwal baru jalan (cooldown)
+    bot.maybe_screener(WED_15_WIB)
+    assert bot.llm.calls == 0 and "EURUSD" in bot.screen_bar          # candle sudah dilihat analisis itu
+    screener_setup(bot, tsettings, [SELL_C], minute=15)
+    bot.journal.set_state("analysis_last_ts", "1")
+    say(bot, "/pause")
+    bot.maybe_screener(WED_15_WIB)
+    assert bot.llm.calls == 0
+    say(bot, "/resume")
+    screener_setup(bot, tsettings, [SELL_C], minute=30)
+    bot.maybe_screener(datetime(2026, 1, 14, 2, 0, tzinfo=timezone.utc))   # 09 WIB: di luar jam
+    bot.s = bot.s.model_copy(update={"ai": bot.s.ai.model_copy(update={"screener": False})})
+    bot.maybe_screener(WED_15_WIB)
+    assert bot.llm.calls == 0
+
+
+def test_screen_candidates_on_real_frames(bot):
+    res = bot.screen_candidates("EURUSD")
+    if res is not None:   # fixture cukup panjang: hasil berupa (bar, daftar kandidat) yang bisa dikirim ke AI
+        bar, cands = res
+        assert "close" in bar and all(c["side"] in ("BUY", "SELL") and c["strategy"] in "ABCDE" for c in cands)
+        json.dumps(cands)
+
+
+def test_gap_notice_after_sleep(bot):
+    bot.check_gap(1_000_000.0)
+    bot.check_gap(1_000_020.0)
+    assert not any("💤" in m for m in bot.notifier.msgs)
+    bot.check_gap(1_000_020.0 + 2 * 3600 + 15 * 60)
+    assert sum("💤 Bot tidak berjalan 2j15m" in m for m in bot.notifier.msgs) == 1
 
 
 def test_evaluation_report(bot):

@@ -382,8 +382,8 @@ def all_signals(f: pd.DataFrame, ip: IntradayParams = IntradayParams()) -> pd.Da
 
 def hybrid(cands: pd.DataFrame) -> pd.DataFrame:
     """F: hanya strategi yang cocok dengan regime bar sinyal (MIXED = tidak trade)."""
-    keep = [s in REGIME_STRATEGIES[r] for s, r in zip(cands["strat"], cands["regime"])]
-    return cands[keep].reset_index(drop=True)
+    keep = np.array([s in REGIME_STRATEGIES[r] for s, r in zip(cands["strat"], cands["regime"])], dtype=bool)
+    return cands[keep].reset_index(drop=True)   # array boolean: tanpa kandidat pun kolom tetap ada
 
 
 # ---------- skor confluence ----------

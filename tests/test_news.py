@@ -68,6 +68,17 @@ def test_blocks_before_high_impact_for_pair_currencies(tmp_path):
     assert cal.blocking_event("EURJPY", later) is None
 
 
+def test_custom_window_for_day_trade_setups(tmp_path):
+    cal = make(tmp_path)
+    cal.refresh(NOW)
+    nfp = datetime(2026, 11, 6, 13, 30, tzinfo=timezone.utc)
+    two_h = nfp - timedelta(hours=2)
+    assert cal.blocking_event("EURUSD", two_h) is not None                       # Ichimoku: 4 jam sebelum
+    assert cal.blocking_event("EURUSD", two_h, before=1.0, after=0.5) is None     # setup AI: 1 jam sebelum
+    assert cal.blocking_event("EURUSD", nfp - timedelta(minutes=30), before=1.0, after=0.5) is not None
+    assert cal.blocking_event("EURUSD", nfp + timedelta(minutes=40), before=1.0, after=0.5) is None
+
+
 def test_blocks_shortly_after_event(tmp_path):
     cal = make(tmp_path)
     cal.refresh(NOW)

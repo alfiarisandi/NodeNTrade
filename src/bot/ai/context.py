@@ -285,8 +285,9 @@ def build_analysis_context(per_symbol: dict[str, dict[str, pd.DataFrame]], p: St
                            spreads: dict[str, float], now: datetime, offset_hours: int = 0, calendar=None,
                            account: dict | None = None, positions: list[dict] | None = None,
                            recent_trades: list[dict] | None = None, rules: dict | None = None,
-                           prices: dict[str, dict] | None = None) -> str:
+                           prices: dict[str, dict] | None = None, pending_orders: list[dict] | None = None) -> str:
     """Snapshot multi-timeframe semua pair untuk analisis harian Claude (tanpa kandidat sinyal).
+    pending_orders = order limit setup yang masih menunggu (hanya diisi saat cek posisi).
     per_symbol = {symbol: {"H4": df, "H1": df, "M15": df, "M5": df}} (frame kosong boleh dihilangkan)."""
     symbols = {}
     for sym, frames in per_symbol.items():
@@ -318,6 +319,7 @@ def build_analysis_context(per_symbol: dict[str, dict[str, pd.DataFrame]], p: St
                                         else "calendar unavailable"),
         "account": account or {},
         "open_positions": positions or [],
+        **({"pending_limit_orders": pending_orders} if pending_orders is not None else {}),
         "last_closed_trades": recent_trades or [],
         "owner_rules": rules or {},
         "symbols": symbols,

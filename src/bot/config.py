@@ -126,6 +126,11 @@ class AICfg(BaseModel):
     weekly_review_hour_utc: int = Field(21, ge=0, le=23)
     # Analisis harian otomatis (tombol 📊 Analisis) di jam-jam WIB ini, hari kerja; kosong = hanya saat diminta
     analysis_hours_wib: list[int] = Field(default_factory=list)
+    # Analisis di luar jadwal per jam (pemicu pantauan AI + kandidat screener M15), maks N per hari WIB
+    # (0 = pantauan nonaktif)
+    max_trigger_analyses_per_day: int = Field(12, ge=0)
+    # Screener M15: tiap candle M15 close cek aturan A-E (tanpa AI); ada kandidat = AI dipanggil menilai
+    screener: bool = False
     # Model cadangan (nama persis di 9Router) bila model utama kena limit / error, dicoba berurutan.
     # Diisi dari AI_FALLBACK_MODELS di .env (pisahkan dengan koma) atau di sini.
     fallback_models: list[str] = Field(default_factory=list)
@@ -160,6 +165,9 @@ class NewsCfg(BaseModel):
     block_impacts: list[str] = ["High"]
     block_before_hours: float = 4.0   # tidak entry jika ada event high impact dalam N jam ke depan
     block_after_hours: float = 1.0    # ... atau baru terjadi kurang dari N jam lalu
+    # Jendela blok untuk setup 📊 Analisis (day trade, ditahan jam-an, bukan hari-an seperti Ichimoku H4)
+    setup_block_before_hours: float = 1.0
+    setup_block_after_hours: float = 0.5
     context_days: float = 5.0         # rentang event yang diberikan ke Claude (≈ lama posisi H4)
     refresh_minutes: int = 180
     cache_path: str = "data/calendar.json"

@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from bot.ai.analysis import Setup, analyze_market, format_setup, parse_analysis, validate_setup
+from bot.ai.analysis import (Setup, analyze_market, format_setup, format_watch, parse_analysis, validate_setup,
+                             watch_problem)
 from bot.ai.context import build_analysis_context
 from conftest import resample_h4
 
@@ -27,6 +28,28 @@ def test_parse_tolerates_fences_and_normalizes():
     assert s.direction == -1 and s.rr == pytest.approx((1.1005 - 1.0950) / (1.1030 - 1.1005))
     with pytest.raises(ValueError):
         parse_analysis("tidak ada json")
+    assert a.watch == []   # jawaban lama tanpa "watch" tetap valid
+
+
+def test_watch_parse_drops_bad_items_and_checks_price():
+    raw = json.dumps({"text": "WAIT", "setups": [], "watch": [
+        dict(symbol="xauusd", side="SELL", trigger="close_below", level=3888.4, invalid_level=3914, strategy="d"),
+        dict(symbol="EURUSD", side="SELL", trigger="zone", zone_low=1.1068, zone_high=1.1063, invalid_level=1.1073),
+        dict(symbol="EURUSD", side="BUY", trigger="breakout", level=1.1),          # pemicu tidak dikenal: dibuang
+        "bukan objek"]})
+    a = parse_analysis(raw)
+    assert len(a.watch) == 2
+    w, z = a.watch
+    assert w.symbol == "XAUUSD" and w.strategy == "D" and w.valid_minutes == 240
+    assert (z.zone_low, z.zone_high) == (1.1063, 1.1068)
+    assert watch_problem(w, 3896.0) is None
+    assert "sudah terpenuhi" in watch_problem(w, 3880.0)
+    assert "pembatal" in watch_problem(w.model_copy(update={"level": 3910.0}), 3916.0)
+    assert watch_problem(z, 1.1050) is None and "sudah di zona" in watch_problem(z, 1.1065)
+    assert w.triggered(3895, 3885, 3887.1) and not w.triggered(3895, 3885, 3889)
+    assert z.triggered(1.1064, 1.1050, 1.1055) and not z.triggered(1.1062, 1.1050, 1.1055)
+    assert w.invalidated(3915) and not w.invalidated(3913)
+    assert "close M15 di bawah 3888.40, batal bila close di atas 3914.00" in format_watch(w, 2)
 
 
 def test_validate_setup_hard_limits():

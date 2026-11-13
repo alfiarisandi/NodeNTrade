@@ -110,12 +110,16 @@ class Calendar:
         cur = pair_currencies(symbol)
         return [e for e in self.events if e.currency in cur and e.impact in impacts and start <= e.time <= end]
 
-    def blocking_event(self, symbol: str, now: datetime) -> Event | None:
-        """Event high impact yang terlalu dekat untuk membuka posisi baru di pair ini."""
+    def blocking_event(self, symbol: str, now: datetime, before: float | None = None,
+                       after: float | None = None) -> Event | None:
+        """Event high impact yang terlalu dekat untuk membuka posisi baru di pair ini. before / after (jam)
+        menggantikan block_before_hours / block_after_hours, mis. jendela pendek untuk setup day trade."""
         if not (self.cfg.enabled and self.available):
             return None
-        hits = self.for_pair(symbol, now - timedelta(hours=self.cfg.block_after_hours),
-                             now + timedelta(hours=self.cfg.block_before_hours), self.cfg.block_impacts)
+        before = self.cfg.block_before_hours if before is None else before
+        after = self.cfg.block_after_hours if after is None else after
+        hits = self.for_pair(symbol, now - timedelta(hours=after), now + timedelta(hours=before),
+                             self.cfg.block_impacts)
         return hits[0] if hits else None
 
     def context(self, symbol: str, now: datetime) -> dict:
