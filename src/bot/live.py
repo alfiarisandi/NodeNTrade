@@ -9,8 +9,8 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from bot.ai.analysis import (FULL_RISK_SCORE, MIN_RR, VALID_SCORE, Analysis, Setup, Watch, analyze_market,
-                             format_setup, format_watch, review_positions, validate_setup, watch_problem)
+from bot.ai.analysis import (MIN_RR, STRONG_SCORE, Analysis, Setup, Watch, analyze_market, format_opportunity,
+                             format_setup, format_watch, net_rr, review_positions, validate_setup, watch_problem)
 from bot.ai.client import LLM
 from bot.ai.context import (build_analysis_context, build_review_context, intraday_snapshot, market_structure,
                             market_summary, session_info, tf_summary)
@@ -24,6 +24,7 @@ from bot.journal import Journal
 from bot.mt5_client import MT5Client, MT5Error
 from bot.news import Calendar
 from bot.notifier import Notifier
+from bot.opportunities import EV_MIN_TRADES, format_opportunity_stats, opportunity_stats, simulate
 from bot.performance import (current_losing_streak, format_evaluation, format_weekly_fallback, intraday_stats,
                              trade_stats, weekly_stats)
 from bot.risk import DailyGuard, DrawdownGuard, check_new_trade, currency_exposure, lot_with_min
@@ -59,6 +60,7 @@ LIMIT_ADVICE_SECONDS = 900    # tombol saran order limit (pindah / batal) berlak
 SCREEN_MIN_BARS = {"M15": 250, "H1": 210, "H4": 210}   # sama dengan intraday_snapshot
 SCREEN_REPEAT_MINUTES = 60    # kandidat screener pair + arah yang sama tidak dikirim ulang ke AI dalam N menit
 SLEEP_GAP_SECONDS = 600      # jarak antar siklus lebih dari ini = bot sempat tertahan (normal ±20 detik)
+OPPORTUNITY_REVIEW_DAYS = 14  # rentang statistik peluang untuk AI dan 📋 Evaluasi
 
 
 def keep_awake(on: bool) -> None:
@@ -94,6 +96,7 @@ class LiveBot:
         self.last_equity_hour = None
         self.watch_bar: dict[str, pd.Timestamp] = {}   # candle M15 terakhir yang sudah dicek untuk pantauan
         self.screen_bar: dict[str, pd.Timestamp] = {}  # ... dan untuk screener M15
+        self.opp_bar: dict[str, pd.Timestamp] = {}     # ... dan untuk penilaian hasil peluang
         self.last_step_wall: float | None = None
         self.review_prompt = review_system(settings.strategy, settings.risk.risk_per_trade)
 
@@ -242,6 +245,10 @@ class LiveBot:
             self.maybe_screener(now)
         except Exception:   # screener tambahan: jangan ikut memicu kill switch
             log.exception("Screener M15 gagal")
+        try:
+            self.resolve_opportunities()
+        except Exception:   # statistik saja: jangan ikut memicu kill switch
+            log.exception("Penilaian peluang gagal")
 
     # ---------- sinyal ----------
     def frames(self, bsym: str) -> dict[str, pd.DataFrame]:
@@ -564,18 +571,21 @@ class LiveBot:
             # Zona belum tercapai (SELL: harga di bawah zona, BUY: di atas): pasang order LIMIT di tengah zona.
             # Di zona / sudah lewat zona ke arah lebih baik: order market, asal RR di harga itu masih cukup.
             zone_ahead = (price < setup["entry_low"] - tol) if d == -1 else (price > setup["entry_high"] + tol)
+            rr_here = net_rr(tp_dist, sl_dist, self.atr_and_cost(sym)[1]) if sl_dist > 0 and tp_dist > 0 else 0.0
             if sl_dist <= 0 or tp_dist <= 0:
                 setup_block = "harga sudah melewati SL/TP setup"
             elif self.setups_today() >= self.s.confirm.max_setups_per_day:
                 setup_block = f"kuota {self.s.confirm.max_setups_per_day} setup/hari sudah terpakai"
-            elif not zone_ahead and tp_dist / sl_dist < MIN_RR - 1e-9:
+            elif self.active_setup_block():
+                setup_block = self.active_setup_block()
+            elif not zone_ahead and rr_here < MIN_RR - 1e-9:
                 setup_block = (f"harga {price:{f}} di luar zona entry {setup['entry_low']:{f}}-{setup['entry_high']:{f}}, "
-                               f"RR di harga ini {tp_dist / sl_dist:.1f} < {MIN_RR:g}")
+                               f"RR bersih di harga ini {rr_here:.2f} < {MIN_RR:g}")
 
         # Kondisi bisa berubah selama menunggu jawaban: cek ulang semuanya
         streak = self.tilt_streak()
-        block = (self.entry_block(sym, bsym, d, acc.equity, spread_pts) or self.news_block(bsym, setup=bool(setup))
-                 or setup_block
+        block = (setup_block or self.entry_block(sym, bsym, d, acc.equity, spread_pts)
+                 or self.news_block(bsym, setup=bool(setup))
                  or (f"cek tilt: {streak} rugi beruntun, maksimal {self.s.risk.risk_per_trade * 100:g}%"
                      if not any(abs(risk - r) < 1e-9 for r in self.allowed_risk_options()) else None)
                  or (f"harga sudah bergerak {moved:.2f} ATR dari harga sinyal"
@@ -819,7 +829,10 @@ class LiveBot:
         used = getattr(self.llm, "last_model", None)
         backup = f" (model cadangan: {used})" if used and used != self.s.ai.model else ""
         watched = self.store_watch(analysis)
+        opps = [format_opportunity(o, self.meta[o.symbol]["digits"]) for o in analysis.opportunities
+                if o.symbol in self.meta]
         self.notify(f"📊 Analisis {now:%a %d/%m %H:%M} WIB{backup}\n\n{analysis.text}"
+                    + ("\n\n🔍 Peluang tercatat (belum dieksekusi):\n" + "\n".join(opps) if opps else "")
                     + ("\n\n👀 Dipantau (analisis ulang otomatis saat pemicu kena):\n" + "\n".join(watched)
                        if watched else ""))
         self.offer_setups(analysis)
@@ -854,14 +867,20 @@ class LiveBot:
         recent = [{"symbol": r["symbol"], "side": "BUY" if r["direction"] == 1 else "SELL",
                    "r": round(r["r_multiple"], 2) if r["r_multiple"] is not None else None,
                    "closed": r["close_time"]} for r in self.journal.recent_closed(5)]
-        r = self.s.risk
-        rules = {"risk_per_trade_options_%": [o * 100 for o in self.s.confirm.risk_options],
+        r, c = self.s.risk, self.s.confirm
+        rules = {"initial_risk_by_tier_%": {"STRONG": round(self.tier_risk(STRONG_SCORE) * 100, 3),
+                                            "MODERATE": round(self.tier_risk(0) * 100, 3)},
                  "max_daily_loss_%": r.max_daily_loss * 100, "today_pnl_%": round(100 * self.daily.pnl_pct(acc.equity), 2),
-                 "max_open_positions": r.max_open_positions, "min_reward_risk": MIN_RR,
-                 "max_setups_per_day": self.s.confirm.max_setups_per_day, "setups_taken_today": self.setups_today(),
+                 "stop_after_consecutive_losses": r.stop_after_losses,
+                 "max_active_setups": c.max_active_setups, "active_setups_now": self.journal.active_setups(),
+                 "min_net_reward_risk": MIN_RR,
+                 "cost_per_symbol_in_price": {s: round(self.atr_and_cost(s)[1], self.meta[s]["digits"]) for s in self.meta},
+                 "max_setups_per_day": c.max_setups_per_day, "setups_taken_today": self.setups_today(),
                  "paused_after_consecutive_losses": self.loss_pause(),
+                 "forward_evidence_by_strategy": self.forward_evidence(),
+                 f"opportunity_review_last_{OPPORTUNITY_REVIEW_DAYS}d": self.opportunity_review(),
                  "execution": "after owner confirms: price not yet at zone = LIMIT order at zone middle, "
-                              "waits valid_minutes; price at/through zone = market order if RR still >= 1.5",
+                              f"waits valid_minutes; price at/through zone = market order if net RR still >= {MIN_RR:g}",
                  "news_block_for_setups": f"{self.s.news.setup_block_before_hours:g}h before to "
                                           f"{self.s.news.setup_block_after_hours:g}h after "
                                           f"{'/'.join(self.s.news.block_impacts)} events of the pair's currencies"}
@@ -896,31 +915,43 @@ class LiveBot:
         return self.journal.setups_executed_since(day.astimezone(timezone.utc).isoformat(timespec="seconds"))
 
     def offer_setups(self, analysis: Analysis) -> None:
-        """Setup yang lolos batas keras & confidence High/Medium ditawarkan lewat tombol konfirmasi yang sama
-        dengan sinyal strategi; sisanya hanya diberitahukan."""
+        """Tahap eksekusi: setup yang lolos batas keras, EV forward & confidence High/Medium ditawarkan lewat tombol
+        konfirmasi yang sama dengan sinyal strategi; sisanya hanya diberitahukan. Semua setup dan peluang (WAIT /
+        NO_TRADE) dicatat di jurnal peluang, lalu hasilnya dinilai dari candle M15 berikutnya."""
         for st, why, atr_h1 in self.setup_checks(analysis):
             digits = self.meta[st.symbol]["digits"]
-            text = format_setup(st, digits)
+            text = format_setup(st, digits) + "\n" + self.ev_text(st.strategy)
+            why = why or self.ev_block(st.strategy)
+            sid = None
             if why:
+                decision = "rejected"
                 self.notify(f"ℹ️ Setup tidak ditawarkan ({why}):\n{text}")
             elif st.confidence == "Low":
+                decision, why = "rejected", "confidence Low"
                 self.notify(f"ℹ️ Setup confidence Low, tidak ditawarkan; tunggu konfirmasi:\n{text}")
             else:
-                self.offer_setup(st, atr_h1, text)
+                why, sid = self.offer_setup(st, atr_h1, text)
+                decision = "blocked" if why else "offered"
+            self.record_setup(st, decision, why, sid)
+        for o in analysis.opportunities:
+            if o.symbol in self.meta:
+                self.record_opportunity(o)
 
-    def offer_setup(self, st, atr_h1: float, text: str) -> None:
+    def offer_setup(self, st, atr_h1: float, text: str) -> tuple[str | None, int | None]:
+        """(alasan tidak ditawarkan | None, id sinyal bila tercatat)."""
         sym, digits = st.symbol, self.meta[st.symbol]["digits"]
         bsym, meta = self.s.broker_symbol(sym), self.meta[sym]
         if self.setups_today() >= self.s.confirm.max_setups_per_day:
             self.notify(f"🚫 Kuota {self.s.confirm.max_setups_per_day} setup/hari sudah terpakai, tidak ditawarkan:\n{text}")
-            return
+            return f"kuota {self.s.confirm.max_setups_per_day} setup/hari", None
         acc = self.mt5.account()
         tick = self.mt5.tick(bsym)
-        block = (self.entry_block(sym, bsym, st.direction, acc.equity, (tick.ask - tick.bid) / meta["point"])
+        block = (self.active_setup_block()
+                 or self.entry_block(sym, bsym, st.direction, acc.equity, (tick.ask - tick.bid) / meta["point"])
                  or self.news_block(bsym, setup=True))
         if block:
             self.notify(f"🚫 Setup tidak ditawarkan ({block}):\n{text}")
-            return
+            return block, None
         now = datetime.now(timezone.utc)
         bar_time = f"setup {now:%Y-%m-%dT%H:%M:%S} {st.entry_mid:.{digits}f}"   # unik per (symbol, bar_time)
         sid = self.journal.log_signal(sym, st.direction, bar_time, st.entry_mid, st.sl_distance, st.tp_distance,
@@ -929,13 +960,13 @@ class LiveBot:
                                    ai_confidence={"High": 0.8, "Medium": 0.5, "Low": 0.2}[st.confidence],
                                    ai_reasons=[st.reason] if st.reason else [], ai_risks=[st.invalid_if] if st.invalid_if else [])
         price_fmt = f".{digits}f"
-        suggested = self.s.risk.risk_per_trade
+        suggested = self.tier_risk(st.score_total)
         lot = self.lot_for(sym, acc.equity, suggested, st.sl_distance)
         if lot == 0:
             why = self.min_lot_reason(sym, acc.equity, st.sl_distance)
             self.journal.update_signal(sid, skip_reason=why)
             self.notify(f"🚫 Setup tidak ditawarkan ({why}):\n{text}")
-            return
+            return why, sid
         sig = Signal(sym, st.direction, pd.Timestamp(now).tz_convert(None), st.entry_mid, atr_h1 or st.sl_distance,
                      st.sl_distance, st.tp_distance, {"atr": atr_h1})
         tp_txt = f"{st.take_profit_1:{price_fmt}}" + (
@@ -944,18 +975,100 @@ class LiveBot:
         ok = self.ask_confirmation(sid, sym, sig, head, st.stop_loss, tp_txt, price_fmt, acc.equity, suggested, lot,
                                    text + "\nKlik: harga belum di zona = pasang order LIMIT di tengah zona; sudah lewat zona = market jika RR masih cukup.",
                                    timeout_minutes=min(self.s.confirm.timeout_minutes, st.valid_minutes),
-                                   suggest_label="Risiko dasar",
-                                   max_risk=self.setup_max_risk(st.score_total, suggested))
+                                   suggest_label=f"Risiko awal {st.grade}", max_risk=suggested)
         if not ok:
             self.journal.update_signal(sid, skip_reason="pesan konfirmasi Telegram gagal terkirim")
             self.journal.open_shadow(sid, st.entry_mid, st.stop_loss, st.take_profit_1)
+            return "pesan konfirmasi Telegram gagal terkirim", sid
+        return None, sid
 
-    def setup_max_risk(self, score: int, suggested: float) -> float | None:
-        """Batas opsi risiko menurut skor setup: premium = semua opsi, valid = sampai risiko dasar,
-        conditional = hanya opsi terkecil."""
-        if score >= FULL_RISK_SCORE:
-            return None
-        return suggested if score >= VALID_SCORE else min(self.s.confirm.risk_options)
+    def tier_risk(self, score: int) -> float:
+        """Risiko awal setup per tingkat skor (Strong / Moderate): opsi risk_options terbesar yang tidak
+        melebihi risk_strong / risk_moderate; opsi di atasnya disembunyikan dari tombol."""
+        c = self.s.confirm
+        cap = c.risk_strong if score >= STRONG_SCORE else c.risk_moderate
+        return max((r for r in c.risk_options if r <= cap + 1e-12), default=min(c.risk_options))
+
+    def active_setup_block(self) -> str | None:
+        n, cap = self.journal.active_setups(), self.s.confirm.max_active_setups
+        return f"sudah ada {n} posisi/limit setup aktif (maks {cap})" if n >= cap else None
+
+    # ---------- EV & catatan peluang (tahap deteksi) ----------
+    def forward_evidence(self) -> dict:
+        """Hasil forward setup 📊 per strategi (trade nyata, sudah bersih dari biaya): dasar EV terkalibrasi."""
+        out: dict[str, list[float]] = {}
+        for r in self.journal.closed_trades("ai_setup"):
+            if r["r_multiple"] is None:
+                continue
+            strat = (json.loads(r["setup"]) if r["setup"] else {}).get("strategy") or "?"
+            out.setdefault(strat, []).append(float(r["r_multiple"]))
+        return {k: {"trades": len(v), "win_%": round(100 * sum(x > 0 for x in v) / len(v)),
+                    "expectancy_R": round(sum(v) / len(v), 3),
+                    "calibrated": len(v) >= EV_MIN_TRADES} for k, v in sorted(out.items())}
+
+    def ev_text(self, strategy: str) -> str:
+        ev = self.forward_evidence().get(strategy or "?")
+        if ev and ev["calibrated"]:
+            return f"EV forward strategi {strategy}: {ev['expectancy_R']:+.2f}R/trade ({ev['trades']} trade, win {ev['win_%']}%)"
+        n = ev["trades"] if ev else 0
+        return (f"EV: UNCALIBRATED (forward {n}/{EV_MIN_TRADES} trade strategi {strategy or '?'}; skor bukan peluang "
+                "menang)")
+
+    def ev_block(self, strategy: str) -> str | None:
+        """Strategi yang EV forward-nya terbukti tidak positif (>= EV_MIN_TRADES trade) tidak ditawarkan lagi."""
+        ev = self.forward_evidence().get(strategy or "?")
+        if ev and ev["calibrated"] and ev["expectancy_R"] <= 0:
+            return f"EV forward strategi {strategy or '?'} {ev['expectancy_R']:+.2f}R dari {ev['trades']} trade"
+        return None
+
+    def opportunity_review(self) -> dict:
+        since = datetime.now(timezone.utc) - timedelta(days=OPPORTUNITY_REVIEW_DAYS)
+        return opportunity_stats(self.journal.opportunities_since(since.isoformat(timespec="seconds")))
+
+    def cost_r(self, sym: str, risk_dist: float) -> float:
+        return self.atr_and_cost(sym)[1] / risk_dist if risk_dist > 0 else 0.0
+
+    def record_setup(self, st: Setup, decision: str, reason: str | None, sid: int | None) -> None:
+        self.journal.log_opportunity(
+            symbol=st.symbol, direction=st.direction, kind="setup", strategy=st.strategy, regime=st.regime,
+            score=st.score_total / 10, tier=st.grade, decision=decision, reason=reason or "", missing=st.missing,
+            activate_if=st.wait_for, entry_low=st.entry_low, entry_high=st.entry_high, stop=st.stop_loss,
+            target=st.take_profit_1, rr=round(st.rr, 2), cost_r=round(self.cost_r(st.symbol, st.sl_distance), 3),
+            valid_minutes=st.valid_minutes, signal_id=sid)
+
+    def record_opportunity(self, o) -> None:
+        mid = (o.entry_low + o.entry_high) / 2 if o.entry_low is not None else None
+        risk = o.direction * (mid - o.invalid_level) if mid is not None and o.invalid_level is not None else 0.0
+        self.journal.log_opportunity(
+            symbol=o.symbol, direction=o.direction, kind="opportunity", strategy=o.strategy, regime=o.regime,
+            score=o.score, tier=o.tier, decision=o.status.lower(), reason=o.reason, missing=o.missing,
+            activate_if=o.activate_if, entry_low=o.entry_low, entry_high=o.entry_high, stop=o.invalid_level,
+            target=o.target, rr=round(o.rr, 2) if o.rr else None,
+            cost_r=round(self.cost_r(o.symbol, risk), 3) if risk > 0 else None, valid_minutes=o.valid_minutes)
+
+    def resolve_opportunities(self) -> None:
+        """Sekali per candle M15 baru: nilai peluang yang masih terbuka (simulasi, bukan trade nyata)."""
+        rows = self.journal.open_opportunities()
+        if not rows:
+            return
+        bars: dict[str, pd.DataFrame] = {}
+        for sym in {r["symbol"] for r in rows} & set(self.meta):
+            last = self.mt5.rates(self.s.broker_symbol(sym), "M15", 1)
+            if last.empty or self.opp_bar.get(sym) == last["time"].iloc[-1]:
+                continue
+            self.opp_bar[sym] = last["time"].iloc[-1]
+            bars[sym] = self.mt5.rates(self.s.broker_symbol(sym), "M15", 600)
+        for r in rows:
+            if r["symbol"] not in bars:
+                continue
+            if None in (r["entry_low"], r["entry_high"], r["stop"], r["target"]):
+                self.journal.resolve_opportunity(r["id"], "untestable", None)
+                continue
+            start = pd.Timestamp(r["created_at"]).tz_convert(None) + pd.Timedelta(hours=self.offset)
+            res = simulate(bars[r["symbol"]], start, r["direction"], r["entry_low"], r["entry_high"], r["stop"],
+                           r["target"], r["valid_minutes"] or 240, r["cost_r"] or 0.0)
+            if res is not None:
+                self.journal.resolve_opportunity(r["id"], *res)
 
     # ---------- ringkasan tiap close candle (tanpa AI) ----------
     def maybe_candle_report(self, now: datetime) -> None:
@@ -1672,7 +1785,12 @@ class LiveBot:
             st = intraday_stats(rule)
             text += (f"\n\nSinyal strategi (Ichimoku): {st['trades']} trade, win rate {st['winrate_%']}%, "
                      f"net {st['net']:+.2f}")
-        return text
+        ev = self.forward_evidence()
+        if ev:
+            text += "\n\nEV forward per strategi: " + "; ".join(
+                f"{k} {v['trades']} trade {v['expectancy_R']:+.2f}R" + ("" if v["calibrated"] else " (UNCALIBRATED)")
+                for k, v in ev.items())
+        return text + "\n\n" + format_opportunity_stats(self.opportunity_review(), OPPORTUNITY_REVIEW_DAYS)
 
     def cmd_evaluation(self) -> None:
         self.notify(self.evaluation_text())

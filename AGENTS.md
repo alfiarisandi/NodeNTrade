@@ -57,7 +57,8 @@ Unit test tidak butuh keduanya karena memakai fake (`FakeMT`, `FakeLLM`, `FakeNo
 | `src/bot/config.py` | model pydantic untuk settings; field baru harus punya default |
 | `src/bot/live.py` | `LiveBot`: `run()` → `step()` tiap ~20 detik; perintah Telegram `cmd_*`; konfirmasi setup; manajemen order limit |
 | `src/bot/ai/prompts.py` | system prompt: review sinyal, `ANALYSIS_SYSTEM`, review posisi, laporan harian |
-| `src/bot/ai/analysis.py` | model `Setup`/`Analysis`, `SCORE_WEIGHTS`, ambang skor, `validate_setup` (batas keras RR, SL, biaya) |
+| `src/bot/ai/analysis.py` | model `Setup`/`Opportunity`/`Analysis`, `SETUP_SCORE_WEIGHTS`, tingkat Strong/Moderate/Weak, `validate_setup` (batas keras RR bersih, SL, biaya) |
+| `src/bot/opportunities.py` | simulasi hasil peluang dari candle M15 dan statistik filter (peluang terlewat, false positive, alasan tidak trade) |
 | `src/bot/ai/context.py` | snapshot JSON yang dikirim ke Claude |
 | `src/bot/intraday.py` | fitur M15, bias H4/H1, regime, sweep/BOS/FVG, strategi riset A–F |
 | `src/bot/risk.py` | lot sizing, batas rugi harian, eksposur mata uang |
@@ -82,7 +83,12 @@ Unit test tidak butuh keduanya karena memakai fake (`FakeMT`, `FakeLLM`, `FakeNo
 
 ## Branch
 
+Riwayat pengerjaan per tanggal: [docs/RIWAYAT.md](docs/RIWAYAT.md). Tambahkan entri baru di sana setiap ada perubahan
+perilaku bot.
+
 - `main`: baseline.
 - `fitur/pantauan-screener`: watchlist pemicu AI, screener M15, blok berita setup 1 jam, cegah laptop tidur.
 - `uji/setelan-kemarin`: uji prompt dan skor versi 12/11 (ambang 70/80, snapshot tanpa blok intraday), dengan
   perintah Telegram terbaru.
+- `fitur/deteksi-adaptif` (dari `fitur/pantauan-screener`): deteksi dua tahap, skor Strong/Moderate/Weak dengan
+  risiko 0,5% / 0,25%, RR bersih ≥ 1,3, EV forward per strategi, satu setup aktif, jurnal peluang.

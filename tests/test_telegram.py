@@ -96,7 +96,7 @@ class FakeAnalysisLLM:
 GOOD_SETUP = dict(symbol="EURUSD", side="BUY", entry_low=1.1990, entry_high=1.2010, stop_loss=1.1950,
                   take_profit_1=1.2110, take_profit_2=1.2200, confidence="High", reason="BOS naik", wait_for="pin bar",
                   invalid_if="close < 1.1950", valid_minutes=90,
-                  score=dict(trend=18, ema=8, momentum=8, structure=13, liquidity=12, price_action=13, location=9, rr=5))
+                  score=dict(context=22, structure=17, liquidity=12, price_action=17, location=13, rr=5))
 
 
 def test_analysis_button_sends_text_and_respects_cooldown(bot):
@@ -104,7 +104,9 @@ def test_analysis_button_sends_text_and_respects_cooldown(bot):
     say(bot, "📊 Analisis")
     msgs = bot.notifier.msgs
     assert msgs[-3].startswith("⏳ Menganalisis") and "EURUSD naik" in msgs[-2]
-    assert msgs[-1].startswith("ℹ️ Setup tidak ditawarkan (RR 0.6 < 1.5)") and bot.llm.calls == 1
+    assert msgs[-1].startswith("ℹ️ Setup tidak ditawarkan (RR bersih 0.55 < 1.3)") and bot.llm.calls == 1
+    opp = bot.journal.opportunities_since("2000-01-01")
+    assert [(o["kind"], o["decision"], o["tier"]) for o in opp] == [("setup", "rejected", "Strong")]
     say(bot, "📊 Analisis")
     assert "Coba lagi dalam" in bot.notifier.msgs[-1] and bot.llm.calls == 1
     assert "📊 Analisis" in bot.menu_rows()[2]
@@ -268,7 +270,7 @@ def add_sell_limit(bot, price, ticket=801):   # FakeMT5 memberi tiket 901+ untuk
     """Order limit SELL dari setup 📊 yang sedang menunggu: SL +30 pip, TP -60 pip, risiko 0.5%."""
     setup = dict(symbol="EURUSD", side="SELL", entry_low=price, entry_high=price, stop_loss=price + 0.0030,
                  take_profit_1=price - 0.0060, take_profit_2=price - 0.0090, reason="supply H1", valid_minutes=120,
-                 score=dict(trend=18, ema=8, momentum=8, structure=13, liquidity=12, price_action=13, location=9, rr=5))
+                 score=dict(context=22, structure=17, liquidity=12, price_action=17, location=13, rr=5))
     sid = bot.journal.log_signal("EURUSD", -1, f"setup {ticket}", price, 0.0030, 0.0060, {}, source="ai_setup",
                                  setup=setup)
     expires = datetime.now(timezone.utc).replace(microsecond=0) + __import__("datetime").timedelta(hours=1)

@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from bot.ai.analysis import (Setup, analyze_market, format_setup, format_watch, parse_analysis, validate_setup,
-                             watch_problem)
+from bot.ai.analysis import (Setup, analyze_market, format_opportunity, format_setup, format_watch, parse_analysis,
+                             validate_setup, watch_problem)
 from bot.ai.context import build_analysis_context
 from conftest import resample_h4
 
@@ -13,7 +13,7 @@ from conftest import resample_h4
 def setup(**kw):
     base = dict(symbol="xauusd", side="BUY", entry_low=2000.0, entry_high=2002.0, stop_loss=1995.0,
                 take_profit_1=2013.0, take_profit_2=2020.0, confidence="High", reason="r", wait_for="w", invalid_if="i",
-                score=dict(trend=18, ema=8, momentum=8, structure=13, liquidity=12, price_action=13, location=9, rr=5))
+                score=dict(context=22, structure=17, liquidity=12, price_action=17, location=13, rr=5))
     base.update(kw)
     return Setup(**base)
 
@@ -100,20 +100,39 @@ def test_analysis_context_structure(uptrend_waves, settings, eurusd_meta):
 
 def test_score_and_cost_limits():
     atr = 4.0
-    low = setup(score=dict(trend=20, ema=10, momentum=10, structure=15, liquidity=0, price_action=0, location=5, rr=0))
-    assert low.score_total == 60 and "skor 60/100 < 65" in validate_setup(low, atr) and low.grade == "No Trade"
-    capped = setup(score=dict(trend=99, ema=10, momentum=10, structure=15, liquidity=15, price_action=15,
-                              location=10, rr=5, bonus=50))
+    # Strong >= 80, Moderate 60-79, Weak < 60 (tidak dieksekusi); konteks tren/EMA/ADX satu komponen
+    weak = setup(score=dict(context=25, structure=20, liquidity=0, price_action=0, location=10, rr=0))
+    assert weak.score_total == 55 and weak.grade == "Weak" and "skor 5.5/10 Weak" in validate_setup(weak, atr)
+    capped = setup(score=dict(context=99, structure=20, liquidity=15, price_action=20, location=15, rr=5, ema=50))
     assert capped.score_total == 100                                   # tiap komponen dibatasi bobotnya
-    cond = setup(score=dict(trend=20, ema=10, momentum=10, structure=15, liquidity=0, price_action=10, location=5))
-    assert (cond.score_total, cond.grade) == (70, "Conditional") and validate_setup(cond, atr) is None
-    labeled = setup(strategy="b", regime="trend")
-    assert (labeled.strategy, labeled.regime) == ("B", "TREND") and setup(strategy="zzz").strategy == ""
-    assert "strategi B Smart Money Concepts" in format_setup(labeled, 2)
-    assert "skor 0/100" in validate_setup(setup(score={}), atr)        # tanpa skor = tidak ditawarkan
-    assert validate_setup(setup(), atr, cost=0.8) is None              # biaya 0.8 dari SL 6 = 13%
+    mod = setup(score=dict(context=20, structure=15, liquidity=10, price_action=0, location=10, rr=5))
+    assert (mod.score_total, mod.grade) == (60, "Moderate") and validate_setup(mod, atr) is None
+    assert setup().grade == "Strong" and "skor 8.6/10 Strong" in format_setup(setup(), 2)
+    labeled = setup(strategy="r", regime="reversal", missing=["MSS M15"])
+    assert (labeled.strategy, labeled.regime) == ("R", "REVERSAL") and setup(strategy="zzz").strategy == ""
+    assert "strategi R Range H1" in format_setup(labeled, 2) and "belum ada: MSS M15" in format_setup(labeled, 2)
+    assert "skor 0/10" in validate_setup(setup(score={}), atr)         # tanpa skor = tidak ditawarkan
+    # RR bersih: biaya mengurangi untung dan menambah rugi. RR kotor 2.0 (SL 6, TP 12)
+    assert validate_setup(setup(), atr, cost=0.8) is None              # (12-0.8)/(6+0.8) = 1.65
+    tight = setup(take_profit_1=2010.0)                                # RR kotor 1.5 -> bersih (9-0.8)/6.8 = 1.21
+    assert tight.rr == pytest.approx(1.5) and "RR bersih 1.21 < 1.3" in validate_setup(tight, atr, cost=0.8)
     assert "SL terlalu sempit" in validate_setup(setup(), atr, cost=1.0)   # 17% > 15%
-    assert "skor 86/100 Premium" in format_setup(setup(), 2)
+
+
+def test_opportunities_parse_and_format():
+    raw = json.dumps({"text": "WAIT", "setups": [], "opportunities": [
+        dict(symbol="xauusd", side="SELL", status="WAIT", strategy="b", regime="reversal", score=6.5,
+             missing=["MSS M15"], entry_low=3901, entry_high=3896, invalid_level=3910, target=3880,
+             reason="belum ada MSS", activate_if="close M15 di bawah 3890"),
+        dict(symbol="EURUSD", side="BUY", status="NO_TRADE", score=4, entry_low=1.1),   # tanpa stop/target
+        dict(symbol="EURUSD", side="BUY", score=11)]})                                     # skor > 10: dibuang
+    a = parse_analysis(raw)
+    o, n = a.opportunities
+    assert (o.symbol, o.strategy, o.regime, o.tier, o.entry_low, o.entry_high) == ("XAUUSD", "B", "REVERSAL",
+                                                                                    "Moderate", 3896, 3901)
+    assert o.rr == pytest.approx((3898.5 - 3880) / (3910 - 3898.5))
+    assert n.tier == "Weak" and n.entry_high == 1.1 and n.rr is None
+    assert format_opportunity(o, 2) == "SELL XAUUSD B (WAIT, skor 6.5/10 Moderate) zona 3896.00-3901.00, batal 3910.00, RR ~1.6"
 
 
 def test_intraday_snapshot_in_context(settings, eurusd_meta):

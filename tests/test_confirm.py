@@ -92,7 +92,7 @@ def make_setup(price, **kw):
     base = dict(symbol="EURUSD", side="BUY", entry_low=price - 0.0005, entry_high=price + 0.0005,
                 stop_loss=price - 0.0040, take_profit_1=price + 0.0100, take_profit_2=price + 0.0150,
                 confidence="High", reason="BOS naik", valid_minutes=60,
-                score=dict(trend=18, ema=8, momentum=8, structure=13, liquidity=12, price_action=13, location=9, rr=5))
+                score=dict(context=22, structure=17, liquidity=12, price_action=17, location=13, rr=5))
     base.update(kw)
     return Setup(**base)
 
@@ -107,7 +107,10 @@ def test_setup_offered_and_executed_at_setup_levels(tmp_path, csettings, at_sign
     offer(bot, mt5)
     row = signal_row(bot)
     assert row["source"] == "ai_setup" and row["user_decision"] == "pending" and row["ai_decision"] == "analysis"
-    assert "SETUP BUY EURUSD" in msgs[-1] and "Risiko dasar" in msgs[-1] and "dalam 30 menit" in msgs[-1]
+    assert "SETUP BUY EURUSD" in msgs[-1] and "Risiko awal Strong: 0.5%" in msgs[-1] and "dalam 30 menit" in msgs[-1]
+    assert "EV: UNCALIBRATED" in msgs[-1]
+    labels = [b for r in bot.notifier.buttons[-1] for b, _ in r]
+    assert [l.split(" ")[1] for l in labels[:-1]] == ["0.25%", "0.5%"]   # Strong: maks 0.5%, tanpa opsi 1%
     click(bot, f"c:{row['id']}:0.005")
     assert len(mt5.orders) == 1
     sym, d, vol, tp_dist = mt5.orders[0]

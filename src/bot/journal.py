@@ -60,6 +60,31 @@ CREATE TABLE IF NOT EXISTS equity (
     balance REAL,
     equity REAL
 );
+CREATE TABLE IF NOT EXISTS opportunities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    direction INTEGER NOT NULL,
+    kind TEXT NOT NULL,              -- setup | opportunity
+    strategy TEXT,
+    regime TEXT,
+    score REAL,                      -- 0-10
+    tier TEXT,                       -- Strong | Moderate | Weak
+    decision TEXT,                   -- offered | rejected | blocked | wait | no_trade
+    reason TEXT,
+    missing TEXT,                    -- JSON list konfirmasi yang belum ada
+    activate_if TEXT,
+    entry_low REAL,
+    entry_high REAL,
+    stop REAL,
+    target REAL,
+    rr REAL,
+    cost_r REAL,
+    valid_minutes INTEGER,
+    signal_id INTEGER,               -- setup yang ditawarkan (signals.id)
+    outcome TEXT DEFAULT 'open',     -- open | win | loss | timeout | not_reached | untestable
+    outcome_r REAL
+);
 """
 
 
@@ -112,6 +137,13 @@ class Journal:
              json.dumps(setup, ensure_ascii=False) if setup is not None else None))
         self.db.commit()
         return cur.lastrowid
+
+    def active_setups(self) -> int:
+        """Posisi terbuka + order limit menunggu yang berasal dari setup 📊 Analisis."""
+        return self.db.execute(
+            "SELECT (SELECT COUNT(*) FROM trades t JOIN signals s ON s.id = t.signal_id"
+            "        WHERE t.status='open' AND s.source='ai_setup')"
+            " + (SELECT COUNT(*) FROM signals WHERE source='ai_setup' AND user_decision='limit')").fetchone()[0]
 
     def setups_executed_since(self, iso_ts: str) -> int:
         """Jumlah setup 📊 Analisis yang benar-benar terisi sejak iso_ts (kuota harian; limit menunggu tidak dihitung)."""
@@ -178,6 +210,30 @@ class Journal:
         return self.db.execute(
             "SELECT * FROM trades WHERE open_time >= ? OR close_time >= ? ORDER BY id", (iso_ts, iso_ts)).fetchall()
 
+    # ---------- peluang terdeteksi (tahap deteksi analisis AI) ----------
+    def log_opportunity(self, **fields) -> int:
+        if isinstance(fields.get("missing"), list):
+            fields["missing"] = json.dumps(fields["missing"], ensure_ascii=False)
+        fields.setdefault("created_at", _now())
+        cols = ", ".join(fields)
+        cur = self.db.execute(f"INSERT INTO opportunities ({cols}) VALUES ({', '.join('?' * len(fields))})",
+                              tuple(fields.values()))
+        self.db.commit()
+        return cur.lastrowid
+
+    def open_opportunities(self) -> list[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM opportunities WHERE outcome='open' ORDER BY id").fetchall()
+
+    def resolve_opportunity(self, opp_id: int, outcome: str, r: float | None) -> None:
+        self.db.execute("UPDATE opportunities SET outcome=?, outcome_r=? WHERE id=?", (outcome, r, opp_id))
+        self.db.commit()
+
+    def opportunities_since(self, iso_ts: str) -> list[sqlite3.Row]:
+        """Peluang sejak iso_ts + apakah setupnya benar-benar terisi (executed)."""
+        return self.db.execute(
+            "SELECT o.*, COALESCE(s.executed, 0) AS executed FROM opportunities o"
+            " LEFT JOIN signals s ON s.id = o.signal_id WHERE o.created_at >= ? ORDER BY o.id", (iso_ts,)).fetchall()
+
     # ---------- state (circuit breaker, laporan terakhir, dll) ----------
     def get_state(self, key: str, default: str | None = None) -> str | None:
         row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
@@ -228,7 +284,7 @@ class Journal:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         paths = []
-        for table in ("signals", "trades", "equity"):
+        for table in ("signals", "trades", "equity", "opportunities"):
             cur = self.db.execute(f"SELECT * FROM {table}")
             path = out_dir / f"{table}.csv"
             with path.open("w", newline="", encoding="utf-8") as fh:

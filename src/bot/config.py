@@ -180,6 +180,10 @@ class ConfirmCfg(BaseModel):
     risk_options: list[float] = [0.0025, 0.005, 0.01]
     max_price_move_atr: float = 0.5   # batalkan jika harga sudah bergerak > N x ATR dari harga sinyal
     max_setups_per_day: int = Field(8, ge=0, le=10)   # setup 📊 Analisis yang boleh dieksekusi per hari (WIB)
+    # Risiko awal setup 📊 per tingkat skor: opsi risk_options terbesar yang tidak melebihinya (di atasnya disembunyikan)
+    risk_strong: float = 0.005        # skor 8-10/10
+    risk_moderate: float = 0.0025     # skor 6-7/10
+    max_active_setups: int = Field(1, ge=1, le=5)   # posisi + limit setup 📊 yang boleh aktif bersamaan
 
     @field_validator("risk_options")
     @classmethod
