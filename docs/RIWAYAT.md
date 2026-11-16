@@ -3,6 +3,43 @@
 Catatan apa saja yang dikerjakan di bot ini, terbaru di atas. Rincian teknis ada di pesan commit
 (`git log`), alasan angka-angka setelan ada di komentar `config/settings.yaml`.
 
+## 2026-11-16: Remediasi audit, Commit D, backtest lebih realistis
+
+Parameter strategi tidak diubah; variasi parameter hanya dilaporkan. Bot live tidak terpengaruh, karena perubahan
+`symbol_meta` hanya menambah data swap.
+
+**Perubahan:**
+- **Swap broker (H7).**
+  - `download_data.py --meta-only` menyimpan data swap broker (`swap_mode`, `swap_long`, `swap_short`,
+    `swap_rollover3days`) ke `data/<SYMBOL>_meta.json`.
+  - Engine menghitung swap per malam: long/short dibedakan, rollover 00:00 jam server, hari 3× sesuai broker
+    (Rabu), dan tanpa rollover di akhir pekan. Mode yang didukung: point, bunga %, dan uang per lot.
+  - R bersih sekarang = R kotor − komisi + swap. Ini berlaku untuk Ichimoku dan intraday.
+- **Biaya eksekusi.** Spread + slippage dalam R (`exec_cost_r`), supaya stress test menggandakan seluruh biaya,
+  bukan hanya komisi.
+- **Entry terlambat.** Opsi `entry_delay` (N bar) untuk mensimulasikan jeda konfirmasi manual.
+- **`backtest.py --robust`** → `reports/backtest_robustness.txt`. Isinya per pair, IS dan OOS terpisah: dasar,
+  biaya ×2 / ×3, entry telat 1 bar, tanpa 1 / 3 trade terbaik, Monte Carlo 5.000×, sensitivitas jarak SL
+  0,6–1,4× setelan, dan kriteria OOS. Kriteria OOS: PF > 1,2 dengan biaya ×2, expectancy > 0, DD ≤ 15R, dan
+  tetap untung tanpa 2 trade terbaik.
+- **Riset intraday per pair.** Kolom baru: swap, PF biaya ×2 / ×3, PF telat 1 bar, total tanpa 3 trade terbaik,
+  dan peluang Monte Carlo total ≤ 0.
+
+**Hasil (data s/d 2026-11-11, R bersih termasuk swap):**
+- **Ichimoku H4 XAUUSD: LULUS kriteria OOS.**
+  - PF IS / OOS 1,32 / 2,00. OOS dengan biaya ×2 PF 1,97; entry telat 1 bar PF 2,13.
+  - Tanpa 3 trade terbaik masih +5,4R (PF 1,20).
+  - Monte Carlo: P(total ≤ 0) 3,3%, DD p95 21,2R.
+  - Sensitivitas SL: PF OOS 1,98–2,13. PF IS lemah di SL 1,5–2 ATR (1,05–1,10).
+- **Ichimoku H4 EURUSD: TIDAK LULUS.**
+  - PF IS / OOS 1,14 / 1,01 (+0,4R).
+  - OOS dengan biaya ×2 PF 0,96; entry telat 1 bar PF 0,89; tanpa trade terbaik negatif.
+  - Monte Carlo: P(total ≤ 0) 36,4%.
+- **Intraday A–F: tidak ada yang lolos di kedua pair.** B di XAUUSD OOS PF 1,18 (biaya ×2 1,13), tetapi telat
+  1 bar PF 0,69, hanya 54 trade, dan P(total ≤ 0) 25%.
+- Keterbatasan: tarif swap sekarang dipakai untuk seluruh histori, data hanya OHLC tanpa tick, dan spread bar
+  adalah spread minimum bar.
+
 ## 2026-11-16: Remediasi audit, Commit C, screener 24/5 catat-saja
 
 Tujuannya mengukur berapa banyak peluang aturan yang sebenarnya tersedia, sebelum jam aktif AI diubah. Jam AI,

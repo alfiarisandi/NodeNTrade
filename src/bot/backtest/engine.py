@@ -26,14 +26,58 @@ class BTTrade:
     exit_price: float
     reason: str
     r_gross: float
-    cost_r: float
-    r_net: float
+    cost_r: float          # komisi dalam R
+    r_net: float           # r_gross - komisi + swap
+    swap_r: float = 0.0    # swap menginap dalam R (negatif = biaya)
+    exec_cost_r: float = 0.0   # spread + slippage yang sudah ada di harga entry/exit, dalam R (untuk stress test)
+
+
+# symbol_info.swap_mode MT5
+SWAP_POINTS, SWAP_INTEREST_CURRENT, SWAP_INTEREST_OPEN = 1, 5, 6
+SWAP_MONEY = (2, 3, 4)   # uang per lot per malam (mata uang dasar / margin / deposit; dianggap mata uang akun)
+
+
+def rollover_nights(entry_time: pd.Timestamp, exit_time: pd.Timestamp, triple_mt5_day: int = 3) -> int:
+    """Jumlah malam swap (rollover 00:00 jam server) yang dilewati posisi. Rollover setelah hari Senin-Jumat saja;
+    rollover setelah hari `triple_mt5_day` (format MT5: 0 = Minggu, 3 = Rabu) dihitung 3x untuk akhir pekan."""
+    triple = (triple_mt5_day - 1) % 7                     # ke format Python: 0 = Senin
+    nights = 0
+    day = entry_time.normalize()
+    while day + pd.Timedelta(days=1) <= exit_time:
+        if day.day_of_week < 5:
+            nights += 3 if day.day_of_week == triple else 1
+        day += pd.Timedelta(days=1)
+    return nights
+
+
+def swap_r(meta: dict, direction: int, entry: float, sl_distance: float, entry_time: pd.Timestamp,
+           exit_time: pd.Timestamp) -> float:
+    """Swap menginap dalam R memakai data swap broker di meta (swap_mode, swap_long, swap_short,
+    swap_rollover3days). Tarif sekarang dipakai untuk seluruh histori (perkiraan). 0 bila meta tidak punya data
+    swap atau mode tidak didukung."""
+    mode = meta.get("swap_mode")
+    if not mode or sl_distance <= 0:
+        return 0.0
+    nights = rollover_nights(entry_time, exit_time, meta.get("swap_rollover3days", 3))
+    if nights == 0:
+        return 0.0
+    rate = meta["swap_long"] if direction == 1 else meta["swap_short"]
+    if mode == SWAP_POINTS:
+        per_night = rate * meta["point"]
+    elif mode in (SWAP_INTEREST_CURRENT, SWAP_INTEREST_OPEN):
+        per_night = entry * rate / 100 / 360
+    elif mode in SWAP_MONEY:
+        loss_per_lot = sl_distance / meta["tick_size"] * meta["tick_value"]
+        return rate * nights / loss_per_lot if loss_per_lot > 0 else 0.0
+    else:
+        return 0.0
+    return per_night * nights / sl_distance
 
 
 def backtest_symbol(symbol: str, entry_df: pd.DataFrame, trend_df: pd.DataFrame, meta: dict,
-                    settings: Settings, offset_hours: int) -> list[BTTrade]:
-    """Satu posisi per simbol. Entry di open bar setelah bar sinyal, termasuk spread & slippage.
-    entry_df/trend_df = bar timeframe strategy.entry_tf / strategy.trend_tf."""
+                    settings: Settings, offset_hours: int, entry_delay: int = 0) -> list[BTTrade]:
+    """Satu posisi per simbol. Entry di open bar setelah bar sinyal (+ entry_delay bar, mis. jeda konfirmasi
+    manual), termasuk spread & slippage. entry_df/trend_df = bar timeframe strategy.entry_tf / strategy.trend_tf."""
     p, bt = settings.strategy, settings.backtest
     max_spread = settings.symbol_cfg(symbol).max_spread_points
     point, tick_size, tick_value = meta["point"], meta["tick_size"], meta["tick_value"]
@@ -58,8 +102,8 @@ def backtest_symbol(symbol: str, entry_df: pd.DataFrame, trend_df: pd.DataFrame,
         if i < busy_until:
             continue
         sig = make_signal(f, i, int(dirs[i]), p, symbol)
-        e = i + 1
-        if spread_pts[e] > max_spread:
+        e = i + 1 + entry_delay
+        if e >= len(f) or spread_pts[e] > max_spread:
             continue
         d = sig.direction
         entry = o[e] + spread[e] + slip if d == 1 else o[e] - slip
@@ -87,8 +131,10 @@ def backtest_symbol(symbol: str, entry_df: pd.DataFrame, trend_df: pd.DataFrame,
         # Komisi dalam satuan R: tidak tergantung equity karena lot sebanding dengan risiko
         loss_per_lot = sig.sl_distance / tick_size * tick_value
         cost_r = bt.commission_per_lot / loss_per_lot if loss_per_lot > 0 else 0.0
+        sw = swap_r(meta, d, entry, sig.sl_distance, times.iloc[e], times.iloc[j])
         trades.append(BTTrade(symbol, d, sig.bar_time, times.iloc[e], times.iloc[j], entry, sl, tp,
-                              exit_price, reason, r_gross, cost_r, r_gross - cost_r))
+                              exit_price, reason, r_gross, cost_r, r_gross - cost_r + sw, swap_r=sw,
+                              exec_cost_r=(spread[e] + 2 * slip) / sig.sl_distance))
         busy_until = j
     return trades
 
@@ -114,8 +160,9 @@ def _exit_kwargs(pol: ExitPolicy, a: dict[str, np.ndarray], atr_: float) -> dict
 
 def backtest_intraday(symbol: str, f: pd.DataFrame, cands: pd.DataFrame, meta: dict, settings: Settings,
                       ip: IntradayParams = IntradayParams(), pol: ExitPolicy = ExitPolicy(),
-                      room_filter: bool = True, one_position: bool = True) -> pd.DataFrame:
-    """Simulasikan kandidat sinyal intraday (bot.intraday) di bar M15. Entry di open bar setelah bar sinyal.
+                      room_filter: bool = True, one_position: bool = True, entry_delay: int = 0) -> pd.DataFrame:
+    """Simulasikan kandidat sinyal intraday (bot.intraday) di bar M15. Entry di open bar setelah bar sinyal
+    (+ entry_delay bar).
     SL = di luar sl_ref + buffer ATR, dilebarkan sampai jarak minimum (ATR H1 dan batas biaya), dilewati bila
     melebihi jarak maksimum. Biaya: spread per bar, slippage, komisi (dalam R). Kolom hasil = BTTrade +
     strategy, regime, high_vol, session, score, room_r, hold_bars."""
@@ -131,7 +178,7 @@ def backtest_intraday(symbol: str, f: pd.DataFrame, cands: pd.DataFrame, meta: d
     weekday = f["time"].dt.day_of_week.to_numpy()
     rows, busy_until = [], 0
     for cand in cands.itertuples():
-        i, d, e = int(cand.i), int(cand.dir), int(cand.i) + 1
+        i, d, e = int(cand.i), int(cand.dir), int(cand.i) + 1 + entry_delay
         if e >= len(f) or (one_position and i < busy_until):
             continue
         atr_, atr_h1 = float(a["atr"][i]), float(a["h1_atr"][i])
@@ -169,10 +216,12 @@ def backtest_intraday(symbol: str, f: pd.DataFrame, cands: pd.DataFrame, meta: d
             exit_price -= d * slip
         r_gross = d * (exit_price - entry) / dist
         cost_r = commission / dist
+        sw = swap_r(meta, d, entry, dist, times.iloc[e], times.iloc[j])
         parts = score_parts(a, i, d, room_r)
         rows.append({"symbol": symbol, "direction": d, "signal_time": times.iloc[i], "entry_time": times.iloc[e],
                      "exit_time": times.iloc[j], "entry": entry, "sl": sl, "tp": tp, "exit_price": exit_price,
-                     "reason": reason, "r_gross": r_gross, "cost_r": cost_r, "r_net": r_gross - cost_r,
+                     "reason": reason, "r_gross": r_gross, "cost_r": cost_r, "r_net": r_gross - cost_r + sw,
+                     "swap_r": sw, "exec_cost_r": (spread[e] + 2 * slip) / dist,
                      "strategy": cand.strat, "regime": regime[i], "high_vol": bool(a["high_vol"][i]),
                      "session": session[e], "score": sum(parts.values()),
                      "room_r": room_r if np.isfinite(room_r) else np.nan, "hold_bars": j - e + 1,
@@ -298,9 +347,9 @@ def load_frames(data_dir: Path, name: str) -> tuple[dict[str, pd.DataFrame], dic
     return frames, meta
 
 
-def run_all(settings: Settings, names: list[str], data_dir: Path) -> pd.DataFrame:
+def run_all(settings: Settings, names: list[str], data_dir: Path, entry_delay: int = 0) -> pd.DataFrame:
     """Backtest semua simbol dengan settings.strategy. Indikator dihitung dari seluruh data (warm-up);
-    filter periode dilakukan pemanggil lewat kolom signal_time."""
+    filter periode dilakukan pemanggil lewat kolom signal_time. entry_delay = entry terlambat N bar."""
     p = settings.strategy
     out = []
     for name in names:
@@ -310,5 +359,6 @@ def run_all(settings: Settings, names: list[str], data_dir: Path) -> pd.DataFram
             offset = meta.get("server_utc_offset")
         if offset is None:
             offset = FALLBACK_OFFSET
-        out.append(to_frame(backtest_symbol(name, frames[p.entry_tf], frames[p.trend_tf], meta, settings, offset)))
+        out.append(to_frame(backtest_symbol(name, frames[p.entry_tf], frames[p.trend_tf], meta, settings, offset,
+                                            entry_delay)))
     return pd.concat(out, ignore_index=True) if out else to_frame([])

@@ -22,6 +22,7 @@ from _common import setup_logging
 
 from bot.backtest.engine import backtest_intraday, load_frames, simulate_portfolio
 from bot.backtest.report import breakdown, extended_metrics, metrics
+from bot.backtest.robustness import monte_carlo, r_stats, stressed, without_top
 from bot.config import load_settings
 from bot.intraday import STRATEGIES, ExitPolicy, IntradayParams, all_signals, hybrid, mtf_features
 from bot.strategy import simulate_exit
@@ -71,14 +72,16 @@ class Lab:
             print(f"{sym}: M15 {f['time'].iloc[0]:%Y-%m-%d} s/d {f['time'].iloc[-1]:%Y-%m-%d}, "
                   f"{len(f)} bar, kandidat {self.data[sym][1]['strat'].value_counts().sort_index().to_dict()}")
 
-    def trades(self, name: str, pol_key: str = "tp1.5R", room_filter: bool = True) -> pd.DataFrame:
+    def trades(self, name: str, pol_key: str = "tp1.5R", room_filter: bool = True, entry_delay: int = 0) -> pd.DataFrame:
         """Trade semua simbol untuk strategi A-E atau F (hybrid), satu posisi per simbol."""
-        return self.custom(name, POLICIES[pol_key], self.ip, room_filter)
+        return self.custom(name, POLICIES[pol_key], self.ip, room_filter, entry_delay)
 
-    def custom(self, name: str, pol: ExitPolicy, ip: IntradayParams, room_filter: bool = True) -> pd.DataFrame:
+    def custom(self, name: str, pol: ExitPolicy, ip: IntradayParams, room_filter: bool = True,
+               entry_delay: int = 0) -> pd.DataFrame:
         """Seperti trades(), dengan ExitPolicy dan parameter SL/filter (ip) bebas. Sinyal tetap dari self.ip.
-        name "R" = pembanding acak: entry tiap 16 bar dengan arah acak (benih tetap), SL di luar 5 bar terakhir."""
-        key = (name, pol, ip, room_filter)
+        name "R" = pembanding acak: entry tiap 16 bar dengan arah acak (benih tetap), SL di luar 5 bar terakhir.
+        entry_delay = entry terlambat N candle M15."""
+        key = (name, pol, ip, room_filter, entry_delay)
         if key not in self._cache:
             out = []
             for sym in self.symbols:
@@ -87,7 +90,7 @@ class Lab:
                     c = random_candidates(f, sym)
                 else:
                     c = hybrid(cands) if name == "F" else cands[cands["strat"] == name]
-                t = backtest_intraday(sym, f, c, meta, self.s, ip, pol, room_filter)
+                t = backtest_intraday(sym, f, c, meta, self.s, ip, pol, room_filter, entry_delay=entry_delay)
                 # Hybrid: ukuran posisi separuh saat volatilitas tinggi
                 t["size"] = np.where(t["high_vol"], 0.5, 1.0) if name == "F" else 1.0
                 out.append(t)
@@ -176,11 +179,27 @@ def study_strategies(lab: Lab, rep: Report, split, end) -> None:
         for name in NAMES:
             t = lab.trades(name)
             t = t[t["symbol"] == sym]
-            rows[name] = {"IS": extended_metrics(period(t, pd.Timestamp.min, split)),
-                          "OOS": extended_metrics(period(t, split, end))}
+            late = lab.trades(name, entry_delay=1)
+            late = late[late["symbol"] == sym]
+            rows[name] = {k: {**extended_metrics(period(t, a, b)), **robust_cols(period(t, a, b)),
+                              "PF_telat_1bar": r_stats(period(late, a, b)["r_net"])["pf"]}
+                          for k, a, b in (("IS", pd.Timestamp.min, split), ("OOS", split, end))}
         df = pd.DataFrame({f"{n} {k}": v for n, r in rows.items() for k, v in r.items()}).T
-        rep.table(f"PER PAIR {sym} | trade mentah per strategi", df.reindex(columns=COLS).dropna(axis=1, how="all"),
+        rep.table(f"PER PAIR {sym} | trade mentah per strategi (R bersih termasuk swap; stress biaya, telat 1 bar, "
+                  f"Monte Carlo)", df.reindex(columns=COLS + ROBUST_COLS).dropna(axis=1, how="all"),
                   f"strategies_{sym}")
+
+
+ROBUST_COLS = ["swap_R", "PF_biaya_x2", "PF_biaya_x3", "PF_telat_1bar", "total_R_tanpa_top3", "MC_P_total<=0_%"]
+
+
+def robust_cols(t: pd.DataFrame) -> dict:
+    """Kolom ketahanan satu kelompok trade: swap rata-rata, PF dengan biaya x2/x3, tanpa 3 trade terbaik, Monte Carlo."""
+    if t.empty:
+        return {}
+    return {"swap_R": round(float(t["swap_r"].mean()), 3), "PF_biaya_x2": r_stats(stressed(t, 2))["pf"],
+            "PF_biaya_x3": r_stats(stressed(t, 3))["pf"], "total_R_tanpa_top3": without_top(t["r_net"], 3)["total_R"],
+            "MC_P_total<=0_%": monte_carlo(t["r_net"]).get("p_total_le_0_%")}
 
 
 def study_regime(lab: Lab, rep: Report, split, end) -> None:

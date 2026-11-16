@@ -96,6 +96,11 @@ class MT5Client:
             "stops_level": info.trade_stops_level,
             "filling_mode": info.filling_mode,
             "currency_profit": info.currency_profit,
+            # swap menginap (backtest): mode MT5, tarif long/short, hari rollover 3x (0 = Minggu, 3 = Rabu)
+            "swap_mode": getattr(info, "swap_mode", 0),
+            "swap_long": getattr(info, "swap_long", 0.0),
+            "swap_short": getattr(info, "swap_short", 0.0),
+            "swap_rollover3days": getattr(info, "swap_rollover3days", 3),
         }
 
     def find_symbols(self, pattern: str) -> list[str]:

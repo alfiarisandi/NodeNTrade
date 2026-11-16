@@ -19,6 +19,8 @@ def main() -> None:
     ap.add_argument("--to", dest="end", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     ap.add_argument("--symbols", nargs="*")
     ap.add_argument("--tf", nargs="*", default=["H1", "H4", "D1"])
+    ap.add_argument("--meta-only", action="store_true",
+                    help="hanya perbarui <SYMBOL>_meta.json (mis. data swap untuk backtest), tanpa unduh candle")
     args = ap.parse_args()
     setup_logging()
 
@@ -38,7 +40,10 @@ def main() -> None:
             bsym = s.broker_symbol(name)
             meta = mt5c.symbol_meta(bsym)
             meta["server_utc_offset"] = offset
-            for tf in args.tf:
+            old = data_dir / f"{name}_meta.json"
+            if args.meta_only and offset is None and old.exists():   # pasar tutup: pakai offset yang tersimpan
+                meta["server_utc_offset"] = json.loads(old.read_text(encoding="utf-8")).get("server_utc_offset")
+            for tf in [] if args.meta_only else args.tf:
                 df = mt5c.rates_range(bsym, tf, start, end)
                 if df.empty:   # rentang melebihi 'Max bars in chart': ambil bar terbanyak yang tersedia
                     df = mt5c.rates(bsym, tf, 99_000)
@@ -52,6 +57,9 @@ def main() -> None:
                     print(f"  ! Data mulai lebih lambat dari {args.start}. Naikkan 'Max bars in chart' di "
                           f"MT5 (Tools > Options > Charts) lalu jalankan ulang.")
             (data_dir / f"{name}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            if args.meta_only:
+                print(f"{name}: meta diperbarui (swap mode {meta['swap_mode']}, long {meta['swap_long']}, "
+                      f"short {meta['swap_short']})")
         print(f"Offset server: {offset if offset is not None else 'tidak terdeteksi (pasar tutup)'}")
     finally:
         mt5c.shutdown()

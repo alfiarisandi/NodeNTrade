@@ -47,6 +47,8 @@ sehingga `--export` bisa membandingkan "aturan saja" vs "aturan + Claude".
 .venv\Scripts\python scripts\run_bot.py --check-llm      # Claude via 9Router tersambung?
 .venv\Scripts\python scripts\download_data.py --from 2019-01-01
 .venv\Scripts\python scripts\backtest.py --split 2024-01-01   # laporan + grafik di reports/
+.venv\Scripts\python scripts\download_data.py --meta-only     # data swap broker ke data/*_meta.json
+.venv\Scripts\python scripts\backtest.py --robust             # + swap, biaya x2/x3, telat 1 bar, Monte Carlo
 .venv\Scripts\python scripts\variants.py --family os           # bandingkan strategi (tf / mr / os)
 .venv\Scripts\python scripts\run_bot.py --test-review EURUSD  # contoh review Claude, tanpa order
 .venv\Scripts\python scripts\run_bot.py --dry-run        # beberapa minggu: catat sinyal tanpa order
