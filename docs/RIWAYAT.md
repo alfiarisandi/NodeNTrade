@@ -8,6 +8,11 @@ Catatan apa saja yang dikerjakan di bot ini, terbaru di atas. Rincian teknis ada
 - **E1, H5:** `manage.partial_at_usd` 10 → 0, sehingga parsial $10 mati. Belum diganti dengan parsial berbasis R.
   Akan dievaluasi ulang setelah ada backtest kebijakan manajemen posisi setup. Parsial di +1R / TP1, breakeven
   1R, dan kunci 0,5R di 1,5R tetap seperti sebelumnya.
+- **E2, H6:** Ichimoku H4 EURUSD masuk mode shadow (`symbols[].rule_mode: shadow`).
+  - Sinyal dicatat dan di-shadow trade (`ai_decision = shadow_mode`), tanpa review AI dan tanpa order.
+  - Posisi EURUSD yang sudah terbuka tetap dikelola (exit sinyal).
+  - Setup 📊 Analisis AI di EURUSD tetap berjalan normal, dan Ichimoku XAUUSD tetap live.
+  - 📋 Evaluasi menampilkan hasil shadow per pair. `ai_vs_rules` mencatatnya di kelompok `mode_shadow`.
 - **Jam AI** tetap 15–23 WIB, dievaluasi setelah 2–4 minggu data screener 24/5.
 - **Risiko per trade** tetap (0,5% dasar; Strong 0,5% / Moderate 0,25%).
 - `tests/test_live_config.py` menjaga keputusan ini dan parameter yang dilindungi: Ichimoku H4 SL 2,5 ATR

@@ -356,6 +356,15 @@ class LiveBot:
         price_fmt = f".{meta['digits']}f"
         tp_txt = format(tp, price_fmt) if tp is not None else "- (exit sinyal)"
 
+        if self.s.symbol_cfg(sym).rule_mode == "shadow":
+            # Edge belum terbukti (audit 2026-11-16 H6): catat + shadow trade untuk dievaluasi, tanpa AI dan order
+            self.journal.update_signal(sid, ai_decision="shadow_mode", ai_multiplier=0.0,
+                                       skip_reason="mode shadow (symbols[].rule_mode)")
+            self.journal.open_shadow(sid, entry, sl, tp)
+            self.notify(f"🧪 Sinyal {p.entry_type} {p.entry_tf} {head} | SL {sl:{price_fmt}} | TP {tp_txt}\n"
+                        f"Mode shadow: hanya dicatat dan dievaluasi, tidak ada order.")
+            return
+
         block = self.entry_block(sym, bsym, sig.direction, acc.equity, spread_pts)
         if block:
             self.journal.update_signal(sid, skip_reason=block)
@@ -1993,6 +2002,12 @@ class LiveBot:
             st = intraday_stats(rule)
             text += (f"\n\nSinyal strategi (Ichimoku): {st['trades']} trade, win rate {st['winrate_%']}%, "
                      f"net {st['net']:+.2f}")
+        shadow = self.journal.shadow_mode_signals()
+        for sym in sorted({r["symbol"] for r in shadow}):
+            rows = [r for r in shadow if r["symbol"] == sym]
+            done = [r["shadow_r"] for r in rows if r["shadow_r"] is not None]
+            text += (f"\n\n🧪 {self.s.strategy.entry_type} {sym} mode shadow: {len(rows)} sinyal, {len(done)} selesai"
+                     + (f", total {sum(done):+.2f}R, win {sum(x > 0 for x in done)}/{len(done)}" if done else ""))
         ev = self.forward_evidence()
         if ev:
             text += "\n\nEV forward per strategi: " + "; ".join(

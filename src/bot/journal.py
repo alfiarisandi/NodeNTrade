@@ -294,7 +294,8 @@ class Journal:
                 if r["user_decision"] in ("approved", "declined", "expired", "blocked"):
                     groups.setdefault(f"setup_ai_user_{r['user_decision']}", []).append(val)
                 continue
-            key = {"reject": "ditolak_ai", "news_block": "diblok_berita"}.get(r["ai_decision"], "diloloskan")
+            key = {"reject": "ditolak_ai", "news_block": "diblok_berita",
+                   "shadow_mode": "mode_shadow"}.get(r["ai_decision"], "diloloskan")
             groups.setdefault(key, []).append(val)
             if r["user_decision"] in ("approved", "declined", "expired"):
                 groups.setdefault(f"user_{r['user_decision']}", []).append(val)
@@ -305,6 +306,10 @@ class Journal:
             summary["semua_sinyal_aturan_saja"] = {"n": len(allr), "total_R": round(sum(allr), 2),
                                                   "avg_R": round(sum(allr) / len(allr), 3)}
         return summary
+
+    def shadow_mode_signals(self) -> list[sqlite3.Row]:
+        """Sinyal strategi aturan di pair mode shadow (symbols[].rule_mode): dicatat + shadow trade, tanpa order."""
+        return self.db.execute("SELECT * FROM signals WHERE ai_decision='shadow_mode' ORDER BY id").fetchall()
 
     def export_csv(self, out_dir: str | Path) -> list[Path]:
         out_dir = Path(out_dir)

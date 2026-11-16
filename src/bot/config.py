@@ -16,6 +16,9 @@ class SymbolCfg(BaseModel):
     name: str
     max_spread_points: float
     max_lot: float = Field(0.0, ge=0)   # batas lot per order untuk simbol ini (0 = tanpa batas)
+    # Sinyal strategi aturan (Ichimoku): live = ditawarkan / dieksekusi | shadow = hanya dicatat + shadow trade,
+    # tanpa review AI dan tanpa order. Setup 📊 Analisis AI tidak terpengaruh.
+    rule_mode: Literal["live", "shadow"] = "live"
 
 
 class StrategyCfg(BaseModel):

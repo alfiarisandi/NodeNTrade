@@ -14,7 +14,9 @@ symbol_suffix: ".m"   # MIFX / Monex-Demo
 # Sesuaikan setelah melihat spread nyata di --check.
 symbols:
   # max_lot: batas lot per order (0 / dihapus = tanpa batas). EURUSD maks 0.1 lot sejak 2026-11-13.
-  - {name: EURUSD, max_spread_points: 20, max_lot: 0.1}
+  # rule_mode: shadow = sinyal Ichimoku hanya dicatat + shadow trade, tanpa AI dan tanpa order (setup AI tetap jalan).
+  # EURUSD shadow sejak 2026-11-16 (audit H6): backtest + swap PF IS/OOS 1.14/1.01, biaya x2 0.96, P(total<=0) 36%.
+  - {name: EURUSD, max_spread_points: 20, max_lot: 0.1, rule_mode: shadow}
   # 11 pair diuji 2026-11-12: out-of-sample 2024-sekarang PF 0.89, DD 17% -> tetap 2 pair.
   - {name: XAUUSD, max_spread_points: 50}
 
