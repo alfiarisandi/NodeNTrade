@@ -174,7 +174,7 @@ def test_setup_limit_sends_expiry_and_warns_when_broker_cannot(tmp_path, ssettin
     bot.journal.update_signal(bot.journal.limit_orders()[0]["id"], user_decision="limit_cancelled")
     mt5.expiry_mode = lambda symbol: "bot"
     mt5.tick = lambda symbol: SimpleNamespace(bid=base - 0.0001, ask=base)
-    bot.offer_setups(Analysis(text="x", setups=[make_setup(base + 0.0002, valid_minutes=90)]))
+    bot.offer_setups(Analysis(text="x", setups=[make_setup(base + 0.0015, valid_minutes=90)]))   # zona lain: bukan duplikat
     mt5.tick = lambda symbol: SimpleNamespace(bid=far - 0.0001, ask=far)
     click(bot, f"c:{bot.journal.pending_confirmations()[0]['id']}:0.005")
     assert "broker tidak mendukung kedaluwarsa" in msgs[-1]

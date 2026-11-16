@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS opportunities (
     cost_r REAL,
     valid_minutes INTEGER,
     signal_id INTEGER,               -- setup yang ditawarkan (signals.id)
-    outcome TEXT DEFAULT 'open',     -- open | win | loss | timeout | not_reached | untestable
+    outcome TEXT DEFAULT 'open',     -- open | win | loss | timeout | not_reached | ambiguous | untestable | duplicate
     outcome_r REAL
 );
 """
@@ -109,9 +109,19 @@ class Journal:
                          ("source", "TEXT DEFAULT 'rule'"),   # rule = sinyal strategi | ai_setup = setup 📊 Analisis
                          ("setup", "TEXT"),                   # JSON setup Claude (zona, TP1/TP2, timeframe, alasan)
                          ("limit_ticket", "INTEGER"),         # order limit pending di MT5 (user_decision = 'limit')
-                         ("limit_expires", "TEXT")]:
-            if col not in have:
+                         ("limit_expires", "TEXT"),
+                         ("ai_model", "TEXT"),                # model AI yang menjawab (review / analisis)
+                         ("shadow_method", "TEXT")]:          # m15_zone = setup dinilai dari M15 + syarat zona;
+            if col not in have:                               # NULL di setup lama = metode H4 lama (bias, audit H4)
                 self.db.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
+        have = {r["name"] for r in self.db.execute("PRAGMA table_info(opportunities)")}
+        for col, typ in [("model", "TEXT"),                  # model AI yang menghasilkan peluang / setup
+                         ("duplicate_of", "INTEGER"),        # ide yang sama dengan baris ini (tidak dihitung ulang)
+                         ("target2", "REAL"),
+                         ("outcome_tp2", "TEXT"),            # TP1 tercapai lalu: win | loss | timeout | ambiguous
+                         ("outcome_r_tp2", "REAL")]:
+            if col not in have:
+                self.db.execute(f"ALTER TABLE opportunities ADD COLUMN {col} {typ}")
 
     def get_signal(self, signal_id: int) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
@@ -165,8 +175,9 @@ class Journal:
     def open_shadows(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM signals WHERE shadow_status='open'").fetchall()
 
-    def resolve_shadow(self, signal_id: int, status: str, r: float | None) -> None:
-        self.update_signal(signal_id, shadow_status=status, shadow_r=r)
+    def resolve_shadow(self, signal_id: int, status: str, r: float | None, method: str | None = None) -> None:
+        self.update_signal(signal_id, shadow_status=status, shadow_r=r,
+                           **({"shadow_method": method} if method else {}))
 
     def recent_signals(self, n: int = 5) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (n,)).fetchall()
@@ -224,14 +235,16 @@ class Journal:
     def open_opportunities(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM opportunities WHERE outcome='open' ORDER BY id").fetchall()
 
-    def resolve_opportunity(self, opp_id: int, outcome: str, r: float | None) -> None:
-        self.db.execute("UPDATE opportunities SET outcome=?, outcome_r=? WHERE id=?", (outcome, r, opp_id))
+    def resolve_opportunity(self, opp_id: int, outcome: str, r: float | None, outcome_tp2: str | None = None,
+                            r_tp2: float | None = None) -> None:
+        self.db.execute("UPDATE opportunities SET outcome=?, outcome_r=?, outcome_tp2=?, outcome_r_tp2=? WHERE id=?",
+                        (outcome, r, outcome_tp2, r_tp2, opp_id))
         self.db.commit()
 
     def opportunities_since(self, iso_ts: str) -> list[sqlite3.Row]:
-        """Peluang sejak iso_ts + apakah setupnya benar-benar terisi (executed)."""
+        """Peluang sejak iso_ts + nasib setupnya di tombol konfirmasi (user_decision) dan apakah benar-benar terisi."""
         return self.db.execute(
-            "SELECT o.*, COALESCE(s.executed, 0) AS executed FROM opportunities o"
+            "SELECT o.*, COALESCE(s.executed, 0) AS executed, s.user_decision AS user_decision FROM opportunities o"
             " LEFT JOIN signals s ON s.id = o.signal_id WHERE o.created_at >= ? ORDER BY o.id", (iso_ts,)).fetchall()
 
     # ---------- state (circuit breaker, laporan terakhir, dll) ----------
@@ -255,10 +268,15 @@ class Journal:
     def ai_vs_rules(self) -> dict:
         """Bandingkan hasil (dalam R) sinyal yang diloloskan vs ditolak AI.
         Sinyal dry-run/ditolak dinilai dari shadow trade; trade nyata dari r_multiple."""
+        # Shadow setup AI dengan metode lama (bar H4, tanpa syarat zona, shadow_method NULL) tidak dihitung: hasilnya
+        # bias (audit 2026-11-16 H4). Datanya tetap disimpan, tidak ditulis ulang. Status tanpa R (not_reached,
+        # ambiguous, untestable) juga tidak dihitung.
         rows = self.db.execute("""
             SELECT s.ai_decision, s.user_decision, s.executed, s.shadow_r, s.source, t.r_multiple
             FROM signals s LEFT JOIN trades t ON t.signal_id = s.id
-            WHERE s.shadow_status NOT IN ('none', 'open', 'expired') OR t.status = 'closed'
+            WHERE t.status = 'closed' OR (s.shadow_r IS NOT NULL
+                  AND s.shadow_status NOT IN ('none', 'open', 'expired')
+                  AND NOT (s.source = 'ai_setup' AND s.shadow_method IS NULL))
         """).fetchall()
         groups: dict[str, list[float]] = {}
         for r in rows:

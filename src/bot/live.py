@@ -24,7 +24,7 @@ from bot.journal import Journal
 from bot.mt5_client import MT5Client, MT5Error
 from bot.news import Calendar
 from bot.notifier import Notifier
-from bot.opportunities import EV_MIN_TRADES, format_opportunity_stats, opportunity_stats, simulate
+from bot.opportunities import EV_MIN_TRADES, find_duplicate, format_opportunity_stats, opportunity_stats, simulate
 from bot.performance import (current_losing_streak, format_evaluation, format_weekly_fallback, intraday_stats,
                              trade_stats, weekly_stats)
 from bot.risk import DailyGuard, DrawdownGuard, check_new_trade, currency_exposure, lot_with_min
@@ -369,7 +369,7 @@ class LiveBot:
         outcome = self.review(sig, frames, meta, entry, spread_pts, acc, open_list)
         self.journal.update_signal(sid, ai_decision=outcome.decision, ai_multiplier=outcome.multiplier,
                                    ai_confidence=outcome.confidence, ai_reasons=outcome.reasons,
-                                   ai_risks=outcome.risks, ai_error=outcome.error)
+                                   ai_risks=outcome.risks, ai_error=outcome.error, ai_model=self.model_used())
 
         suggested = self.s.risk.risk_per_trade * outcome.multiplier
         lot = self.lot_for(sym, acc.equity, suggested, sig.sl_distance)
@@ -996,12 +996,20 @@ class LiveBot:
         """Tahap eksekusi: setup yang lolos batas keras, EV forward & confidence High/Medium ditawarkan lewat tombol
         konfirmasi yang sama dengan sinyal strategi; sisanya hanya diberitahukan. Semua setup dan peluang (WAIT /
         NO_TRADE) dicatat di jurnal peluang, lalu hasilnya dinilai dari candle M15 berikutnya."""
+        recent = self.recent_opportunities()
         for st, why, atr_h1 in self.setup_checks(analysis):
             digits = self.meta[st.symbol]["digits"]
             text = format_setup(st, digits) + "\n" + self.ev_text(st.strategy)
             why = why or self.ev_block(st.strategy)
             sid = None
-            if why:
+            again = find_duplicate(recent, st.symbol, st.direction, st.entry_low, st.entry_high,
+                                   datetime.now(timezone.utc), decisions=("offered",))
+            if again:   # ide yang sama sudah ditawarkan dan masih berlaku: jangan tawarkan / hitung ulang
+                when = datetime.fromisoformat(next(r["created_at"] for r in recent if r["id"] == again))
+                decision, why = "duplicate", f"sama dengan setup #{again} yang sudah ditawarkan"
+                self.notify(f"ℹ️ Setup {st.side} {st.symbol} sama dengan yang sudah ditawarkan "
+                            f"{when.astimezone(WIB):%H:%M} WIB (zona tumpang tindih, masih berlaku): tidak ditawarkan ulang.")
+            elif why:
                 decision = "rejected"
                 self.notify(f"ℹ️ Setup tidak ditawarkan ({why}):\n{text}")
             elif st.confidence == "Low":
@@ -1034,7 +1042,7 @@ class LiveBot:
         bar_time = f"setup {now:%Y-%m-%dT%H:%M:%S} {st.entry_mid:.{digits}f}"   # unik per (symbol, bar_time)
         sid = self.journal.log_signal(sym, st.direction, bar_time, st.entry_mid, st.sl_distance, st.tp_distance,
                                       {"atr": atr_h1}, source="ai_setup", setup=st.model_dump())
-        self.journal.update_signal(sid, ref_price=st.entry_mid, ai_decision="analysis",
+        self.journal.update_signal(sid, ref_price=st.entry_mid, ai_decision="analysis", ai_model=self.model_used(),
                                    ai_confidence={"High": 0.8, "Medium": 0.5, "Low": 0.2}[st.confidence],
                                    ai_reasons=[st.reason] if st.reason else [], ai_risks=[st.invalid_if] if st.invalid_if else [])
         price_fmt = f".{digits}f"
@@ -1106,18 +1114,37 @@ class LiveBot:
     def cost_r(self, sym: str, risk_dist: float) -> float:
         return self.atr_and_cost(sym)[1] / risk_dist if risk_dist > 0 else 0.0
 
+    def model_used(self) -> str | None:
+        """Model AI yang benar-benar menjawab permintaan terakhir (utama atau cadangan)."""
+        return getattr(self.llm, "last_model", None) or (self.s.ai.model if self.llm is not None else None)
+
+    def recent_opportunities(self) -> list:
+        since = datetime.now(timezone.utc) - timedelta(days=1)
+        return self.journal.opportunities_since(since.isoformat(timespec="seconds"))
+
+    def log_idea(self, duplicate_of: int | None = None, **fields) -> None:
+        """Catat satu baris peluang. Ide yang sama dengan baris yang masih berlaku (pair + arah + zona tumpang
+        tindih) ditandai duplicate_of dan tidak disimulasikan ulang, supaya satu ide tidak terhitung berkali-kali."""
+        if duplicate_of is None:
+            duplicate_of = find_duplicate(self.recent_opportunities(), fields["symbol"], fields["direction"],
+                                          fields.get("entry_low"), fields.get("entry_high"), datetime.now(timezone.utc))
+        if duplicate_of:
+            fields.update(duplicate_of=duplicate_of, outcome="duplicate")
+        self.journal.log_opportunity(model=self.model_used(), **fields)
+
     def record_setup(self, st: Setup, decision: str, reason: str | None, sid: int | None) -> None:
-        self.journal.log_opportunity(
-            symbol=st.symbol, direction=st.direction, kind="setup", strategy=st.strategy, regime=st.regime,
-            score=st.score_total / 10, tier=st.grade, decision=decision, reason=reason or "", missing=st.missing,
-            activate_if=st.wait_for, entry_low=st.entry_low, entry_high=st.entry_high, stop=st.stop_loss,
-            target=st.take_profit_1, rr=round(st.rr, 2), cost_r=round(self.cost_r(st.symbol, st.sl_distance), 3),
-            valid_minutes=st.valid_minutes, signal_id=sid)
+        dup = int(reason.split("#")[1].split()[0]) if decision == "duplicate" else None
+        self.log_idea(
+            duplicate_of=dup, symbol=st.symbol, direction=st.direction, kind="setup", strategy=st.strategy,
+            regime=st.regime, score=st.score_total / 10, tier=st.grade, decision=decision, reason=reason or "",
+            missing=st.missing, activate_if=st.wait_for, entry_low=st.entry_low, entry_high=st.entry_high,
+            stop=st.stop_loss, target=st.take_profit_1, target2=st.take_profit_2, rr=round(st.rr, 2),
+            cost_r=round(self.cost_r(st.symbol, st.sl_distance), 3), valid_minutes=st.valid_minutes, signal_id=sid)
 
     def record_opportunity(self, o) -> None:
         mid = (o.entry_low + o.entry_high) / 2 if o.entry_low is not None else None
         risk = o.direction * (mid - o.invalid_level) if mid is not None and o.invalid_level is not None else 0.0
-        self.journal.log_opportunity(
+        self.log_idea(
             symbol=o.symbol, direction=o.direction, kind="opportunity", strategy=o.strategy, regime=o.regime,
             score=o.score, tier=o.tier, decision=o.status.lower(), reason=o.reason, missing=o.missing,
             activate_if=o.activate_if, entry_low=o.entry_low, entry_high=o.entry_high, stop=o.invalid_level,
@@ -1125,12 +1152,14 @@ class LiveBot:
             cost_r=round(self.cost_r(o.symbol, risk), 3) if risk > 0 else None, valid_minutes=o.valid_minutes)
 
     def resolve_opportunities(self) -> None:
-        """Sekali per candle M15 baru: nilai peluang yang masih terbuka (simulasi, bukan trade nyata)."""
+        """Sekali per candle M15 baru: nilai peluang yang masih terbuka dan shadow trade setup AI yang tidak
+        dieksekusi (simulasi M15 dengan syarat zona tersentuh, bukan trade nyata)."""
         rows = self.journal.open_opportunities()
-        if not rows:
+        shadows = [r for r in self.journal.open_shadows() if r["source"] == "ai_setup" and r["setup"]]
+        if not rows and not shadows:
             return
         bars: dict[str, pd.DataFrame] = {}
-        for sym in {r["symbol"] for r in rows} & set(self.meta):
+        for sym in ({r["symbol"] for r in rows} | {r["symbol"] for r in shadows}) & set(self.meta):
             last = self.mt5.rates(self.s.broker_symbol(sym), "M15", 1)
             if last.empty or self.opp_bar.get(sym) == last["time"].iloc[-1]:
                 continue
@@ -1142,11 +1171,29 @@ class LiveBot:
             if None in (r["entry_low"], r["entry_high"], r["stop"], r["target"]):
                 self.journal.resolve_opportunity(r["id"], "untestable", None)
                 continue
-            start = pd.Timestamp(r["created_at"]).tz_convert(None) + pd.Timedelta(hours=self.offset)
-            res = simulate(bars[r["symbol"]], start, r["direction"], r["entry_low"], r["entry_high"], r["stop"],
-                           r["target"], r["valid_minutes"] or 240, r["cost_r"] or 0.0)
+            res = simulate(bars[r["symbol"]], self.server_time(r["created_at"]), r["direction"], r["entry_low"],
+                           r["entry_high"], r["stop"], r["target"], r["valid_minutes"] or 240, r["cost_r"] or 0.0,
+                           target2=r["target2"])
             if res is not None:
-                self.journal.resolve_opportunity(r["id"], *res)
+                self.journal.resolve_opportunity(r["id"], res.outcome, res.r, res.tp2_outcome, res.r_tp2)
+        for r in shadows:
+            if r["symbol"] in bars:
+                self.resolve_setup_shadow(r, bars[r["symbol"]])
+
+    def server_time(self, iso_utc: str) -> pd.Timestamp:
+        return pd.Timestamp(iso_utc).tz_convert(None) + pd.Timedelta(hours=self.offset)
+
+    def resolve_setup_shadow(self, row, bars: pd.DataFrame) -> None:
+        """Shadow setup AI (ditolak / tidak dijawab / diblok saat eksekusi): entry hanya bila zona tersentuh dalam
+        valid_minutes, SL/TP berurutan di M15, ambiguous bila tidak bisa diketahui (audit 2026-11-16 H4)."""
+        st = json.loads(row["setup"])
+        d = row["direction"]
+        cost_r = self.cost_r(row["symbol"], d * ((st["entry_low"] + st["entry_high"]) / 2 - st["stop_loss"]))
+        res = simulate(bars, self.server_time(row["created_at"]), d, st["entry_low"], st["entry_high"],
+                       st["stop_loss"], st["take_profit_1"], st.get("valid_minutes") or 120, cost_r)
+        if res is not None:
+            status = {"win": "tp", "loss": "sl", "untestable": "expired"}.get(res.outcome, res.outcome)
+            self.journal.resolve_shadow(row["id"], status, res.r, method="m15_zone")
 
     # ---------- ringkasan tiap close candle (tanpa AI) ----------
     def maybe_candle_report(self, now: datetime) -> None:
@@ -2075,16 +2122,13 @@ class LiveBot:
         for row in self.journal.open_shadows():
             sym = row["symbol"]
             meta = self.meta.get(sym)
-            if meta is None:
+            if meta is None or row["source"] == "ai_setup":   # setup AI: resolve_setup_shadow (M15 + zona)
                 continue
             if sym not in features:
                 frames = self.frames(self.s.broker_symbol(sym))
                 features[sym] = compute_features(frames[p.entry_tf], frames[p.trend_tf], p, self.offset)
             f = features[sym]
-            if row["source"] == "ai_setup":   # bar_time setup = label teks, waktu nyata ada di created_at (UTC)
-                bar_time = pd.Timestamp(row["created_at"]).tz_convert(None) + pd.Timedelta(hours=self.offset)
-            else:
-                bar_time = pd.Timestamp(row["bar_time"])
+            bar_time = pd.Timestamp(row["bar_time"])
             if f.empty:
                 continue
             if f["time"].iloc[0] > bar_time:

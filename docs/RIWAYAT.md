@@ -3,6 +3,30 @@
 Catatan apa saja yang dikerjakan di bot ini, terbaru di atas. Rincian teknis ada di pesan commit
 (`git log`), alasan angka-angka setelan ada di komentar `config/settings.yaml`.
 
+## 2026-11-16: Remediasi audit, Commit B, integritas pengukuran
+
+Tidak mengubah keputusan trading. Satu perilaku baru yang terlihat: setup yang sama tidak ditawarkan ulang.
+
+- **Shadow setup AI (H4).**
+  - Setup yang tidak dieksekusi (ditolak, tidak dijawab, diblok, gagal) kini dinilai dari candle M15.
+  - Entry hanya dianggap terjadi bila zona tersentuh dalam `valid_minutes`.
+  - Tidak lagi memakai bar H4 dan exit Ichimoku, dan biaya ikut dihitung.
+  - Hasil lama tidak ditulis ulang. Baris setup dengan `shadow_method` NULL dikecualikan dari `ai_vs_rules`
+    karena bias.
+  - Verifikasi pada salinan jurnal 12/11: 4 shadow XAUUSD "TP +21,6R" menjadi `not_reached`.
+- **Simulasi (M1).**
+  - SL dan TP di candle yang sama, atau TP di candle pengisian, berstatus AMBIGUOUS dan tidak ditebak.
+  - TP2 dinilai setelah TP1 (dengan SL awal).
+  - Batas entry mengikuti `valid_minutes` setup.
+- **Deduplikasi (M7).**
+  - Setup dengan pair, arah, dan zona yang tumpang tindih dengan setup yang sudah ditawarkan dan masih berlaku
+    tidak ditawarkan ulang.
+  - Pengulangan ide (termasuk WAIT yang diulang tiap jam) ditautkan lewat `duplicate_of` dan dihitung satu kali.
+- **Model AI (M8)** dicatat di setiap baris peluang (`opportunities.model`) dan sinyal (`signals.ai_model`).
+- **Corong keputusan di 📋 Evaluasi.** Setiap ide dicatat tahap terjauhnya: AI WAIT, skor Weak / confidence
+  Low, gerbang kode, manajemen risiko, ditawarkan, ditolak / tidak dijawab pemilik, diblok saat eksekusi, gagal
+  eksekusi, limit tidak terisi, atau dieksekusi. Ditambah daftar tahap tempat peluang menang paling banyak hilang.
+
 ## 2026-11-16: Remediasi audit, Commit A, keamanan eksekusi (branch `fitur/remediasi-audit`)
 
 Acuan perubahan ini adalah [AUDIT-2026-11-16.md](AUDIT-2026-11-16.md). Strategi, parameter entry, dan risiko per
