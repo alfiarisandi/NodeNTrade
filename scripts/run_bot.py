@@ -15,6 +15,7 @@
 """
 import argparse
 import json
+import logging
 import sys
 
 import numpy as np
@@ -225,8 +226,16 @@ def analysis_now(s) -> None:
 
 
 def run(s, dry_run: bool) -> None:
+    from bot.instance import EXIT_ALREADY_RUNNING, AlreadyRunning, InstanceLock
     from bot.live import LiveBot
 
+    lock = InstanceLock(s.path("data/bot.lock"))
+    try:
+        lock.acquire()   # dilepas OS saat proses berhenti
+    except AlreadyRunning as e:
+        logging.getLogger("bot").error("%s. Instance ini berhenti tanpa restart.", e)
+        print(f"❌ {e}. Instance ini berhenti.", file=sys.stderr)
+        sys.exit(EXIT_ALREADY_RUNNING)
     llm = None
     if s.ai.enabled:
         try:

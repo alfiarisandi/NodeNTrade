@@ -3,6 +3,33 @@
 Catatan apa saja yang dikerjakan di bot ini, terbaru di atas. Rincian teknis ada di pesan commit
 (`git log`), alasan angka-angka setelan ada di komentar `config/settings.yaml`.
 
+## 2026-11-16: Remediasi audit, Commit A, keamanan eksekusi (branch `fitur/remediasi-audit`)
+
+Acuan perubahan ini adalah [AUDIT-2026-11-16.md](AUDIT-2026-11-16.md). Strategi, parameter entry, dan risiko per
+trade tidak diubah.
+
+- **Satu instance per mesin (C1).** `run_bot.py --live/--dry-run` memegang kunci `data/bot.lock`. Kuncinya
+  dilepas OS saat proses mati, jadi tidak ada kunci basi. Instance kedua keluar dengan kode 3, dan
+  `run_forever.ps1` tidak me-restart kode itu.
+- **Bot di PC lain (C1).** Terdeteksi lewat Telegram `getUpdates` HTTP 409 Conflict. Saat konflik:
+  - Entry baru diblok dan ada satu peringatan 🚨.
+  - Polling diperlambat menjadi 60 detik.
+  - Entry pulih otomatis setelah 10 menit tanpa 409.
+- **Batas rugi harian (H1).** Equity awal hari (WIB) disimpan di jurnal (`daily_day`, `daily_start_equity`),
+  jadi restart tidak lagi mereset batasnya. Pergantian hari kini pukul 00:00 WIB (sebelumnya 07:00 WIB / UTC),
+  sama dengan kuota setup.
+- **Kedaluwarsa order limit (H2).**
+  - Order limit setup memakai `ORDER_TIME_SPECIFIED`, sehingga server MT5 membatalkannya tepat waktu walau bot
+    mati.
+  - Bila broker tidak mendukung, bot memakai `ORDER_TIME_DAY` atau GTC, dan pesan Telegram memberi peringatan.
+  - Monex-Demo mendukung mode ini (`expiration_mode` = 15).
+- **Kesegaran data (M9).** Entry ditolak bila terminal tidak tersambung ke server, atau tick lebih tua dari
+  60 detik saat pasar seharusnya buka. Pasar tutup (akhir pekan, jeda harian logam) dibedakan dari feed yang
+  terputus, dan alasannya tercatat di jurnal peluang.
+- **Offset jam server dideteksi ulang tiap jam saat pasar buka**, kecuali offset diisi manual di setelan. Tanpa
+  ini, bot yang start di akhir pekan dengan cadangan GMT+2 akan salah menghitung umur tick 1 jam saat server
+  GMT+3 (DST), dan semua entry terblok.
+
 ## 2026-11-16: Deteksi peluang adaptif (branch `fitur/deteksi-adaptif`)
 
 **Latar belakang:** analisis AI terlalu sering menjawab WAIT, karena semua konfirmasi opsional diperlakukan

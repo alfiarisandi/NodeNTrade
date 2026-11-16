@@ -14,6 +14,7 @@ log = logging.getLogger(__name__)
 TIMEFRAMES = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "M30": "TIMEFRAME_M30",
               "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1"}
 RETRY_CODES = {10004, 10020, 10021}  # requote, price changed, price off
+EXPIRATION_DAY, EXPIRATION_SPECIFIED = 2, 4   # flag symbol_info.expiration_mode (tidak diekspor modul MetaTrader5)
 
 
 class MT5Error(RuntimeError):
@@ -179,13 +180,28 @@ class MT5Client:
         detail = f"{last.retcode} {last.comment}" if last is not None else str(self.mt5.last_error())
         raise MT5Error(f"Order {symbol} gagal: {detail}")
 
+    def expiry_mode(self, symbol: str) -> str:
+        """Cara order limit kedaluwarsa di broker ini: "server" = waktu tertentu (tetap batal walau bot mati),
+        "day" = hanya akhir hari, "bot" = GTC, hanya dibatalkan bot selama bot berjalan."""
+        mode = self.mt5.symbol_info(symbol).expiration_mode
+        return "server" if mode & EXPIRATION_SPECIFIED else "day" if mode & EXPIRATION_DAY else "bot"
+
     def limit_order(self, symbol: str, direction: int, volume: float, price: float, sl: float, tp: float,
-                    magic: int, comment: str):
-        """Pending BUY/SELL LIMIT (SL & TP harga absolut, tanpa kedaluwarsa: bot yang membatalkan). Raise MT5Error jika gagal."""
+                    magic: int, comment: str, expires: datetime | None = None, offset_hours: int = 0):
+        """Pending BUY/SELL LIMIT (SL & TP harga absolut). `expires` (UTC) dipasang sebagai kedaluwarsa di server
+        bila broker mendukung (expiry_mode); waktu MT5 = waktu server, jadi digeser offset_hours. Raise MT5Error
+        jika gagal."""
         meta = self.symbol_meta(symbol)
         t = self.tick(symbol)
         if abs(price - (t.ask if direction == 1 else t.bid)) <= meta["stops_level"] * meta["point"]:
             raise MT5Error(f"Harga limit terlalu dekat dengan harga pasar (stops level {meta['stops_level']})")
+        mode = self.expiry_mode(symbol) if expires is not None else "bot"
+        timing = {"type_time": self.mt5.ORDER_TIME_GTC}
+        if mode == "server":
+            timing = {"type_time": self.mt5.ORDER_TIME_SPECIFIED,
+                      "expiration": int(expires.timestamp()) + offset_hours * 3600}
+        elif mode == "day":
+            timing = {"type_time": self.mt5.ORDER_TIME_DAY}
         res = self.mt5.order_send({
             "action": self.mt5.TRADE_ACTION_PENDING,
             "symbol": symbol,
@@ -196,13 +212,23 @@ class MT5Client:
             "tp": round(tp, meta["digits"]) if tp else 0.0,
             "magic": magic,
             "comment": comment[:31],
-            "type_time": self.mt5.ORDER_TIME_GTC,
+            **timing,
             "type_filling": self.mt5.ORDER_FILLING_RETURN,
         })
         if res is None or res.retcode != self.mt5.TRADE_RETCODE_DONE:
             detail = f"{res.retcode} {res.comment}" if res is not None else str(self.mt5.last_error())
             raise MT5Error(f"Order limit {symbol} gagal: {detail}")
         return res
+
+    def feed_status(self, symbol: str, offset_hours: int) -> dict:
+        """Kesegaran data: terminal tersambung ke server broker, umur tick terakhir (detik), dan jam server
+        sekarang. Waktu tick MT5 = jam server, jadi jam sekarang digeser offset_hours."""
+        info = self.mt5.terminal_info()
+        tick = self.mt5.symbol_info_tick(symbol)
+        server_now = time.time() + offset_hours * 3600
+        return {"connected": bool(info is not None and info.connected),
+                "tick_age": server_now - tick.time if tick is not None else float("inf"),
+                "server_time": datetime.fromtimestamp(server_now, timezone.utc).replace(tzinfo=None)}
 
     def pending_orders(self, magic: int) -> list:
         return [o for o in (self.mt5.orders_get() or ()) if o.magic == magic]

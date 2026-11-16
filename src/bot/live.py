@@ -61,6 +61,21 @@ SCREEN_MIN_BARS = {"M15": 250, "H1": 210, "H4": 210}   # sama dengan intraday_sn
 SCREEN_REPEAT_MINUTES = 60    # kandidat screener pair + arah yang sama tidak dikirim ulang ke AI dalam N menit
 SLEEP_GAP_SECONDS = 600      # jarak antar siklus lebih dari ini = bot sempat tertahan (normal ±20 detik)
 OPPORTUNITY_REVIEW_DAYS = 14  # rentang statistik peluang untuk AI dan 📋 Evaluasi
+MAX_TICK_AGE_SECONDS = 60     # tick lebih tua dari ini saat pasar buka = feed dianggap terputus, entry ditolak
+LIMIT_EXPIRY_TEXT = {"server": "batal otomatis di server MT5 {t} WIB (tetap batal walau bot mati)",
+                     "day": "⚠️ broker hanya mendukung kedaluwarsa akhir hari: bot membatalkan {t} WIB selama "
+                            "berjalan, server membatalkan di akhir hari",
+                     "bot": "⚠️ broker tidak mendukung kedaluwarsa: hanya bot yang membatalkan {t} WIB; bila bot "
+                            "mati, limit tetap aktif di MT5"}
+
+
+def market_closed(server_time: datetime, symbol: str) -> bool:
+    """Perkiraan pasar tutup (jam server broker GMT+2/+3): Sabtu-Minggu, Senin sebelum 00:05, dan jeda harian
+    logam 23:55-01:05. Dipakai untuk membedakan pasar tutup dari feed yang terputus."""
+    wd, minute = server_time.weekday(), server_time.hour * 60 + server_time.minute
+    if wd >= 5 or (wd == 0 and minute < 5):
+        return True
+    return symbol.upper().startswith(("XAU", "XAG")) and (minute >= 23 * 60 + 55 or minute < 65)
 
 
 def keep_awake(on: bool) -> None:
@@ -97,6 +112,8 @@ class LiveBot:
         self.watch_bar: dict[str, pd.Timestamp] = {}   # candle M15 terakhir yang sudah dicek untuk pantauan
         self.screen_bar: dict[str, pd.Timestamp] = {}  # ... dan untuk screener M15
         self.opp_bar: dict[str, pd.Timestamp] = {}     # ... dan untuk penilaian hasil peluang
+        self.conflict_warned = False                   # peringatan instance lain (Telegram 409) sudah dikirim
+        self.offset_checked: tuple | None = None       # (tanggal, jam) UTC terakhir offset server dicek ulang
         self.last_step_wall: float | None = None
         self.review_prompt = review_system(settings.strategy, settings.risk.risk_per_trade)
 
@@ -199,13 +216,67 @@ class LiveBot:
                     f"itu terlewat. SL/TP yang sudah terpasang tetap berlaku di server broker, tapi pengelolaan "
                     f"posisi (parsial, trailing, exit sinyal) ikut berhenti selama itu.")
 
+    def update_daily(self, now: datetime, equity: float) -> None:
+        """Batas rugi harian per hari WIB. Equity awal hari disimpan di jurnal, jadi restart di tengah hari tidak
+        mereset batas. Equity sudah termasuk floating P/L posisi terbuka."""
+        wib = now.astimezone(WIB)
+        if self.daily.day is None and self.journal.get_state("daily_day") == wib.date().isoformat():
+            self.daily.day = wib.date()
+            self.daily.start_equity = float(self.journal.get_state("daily_start_equity") or equity)
+            log.info("Batas rugi harian dipulihkan: equity awal %s %.2f", self.daily.day, self.daily.start_equity)
+        if self.daily.update(wib, equity):
+            self.journal.set_state("daily_day", self.daily.day.isoformat())
+            self.journal.set_state("daily_start_equity", f"{equity:.2f}")
+            log.info("Hari baru %s (WIB), equity awal %.2f", self.daily.day, equity)
+
+    def check_conflict(self) -> None:
+        """Telegram 409 = instance bot lain memakai token yang sama (mis. PC lain di akun ini): beri tahu sekali
+        saat mulai dan sekali saat selesai. Selama konflik, entry_block menolak entry baru."""
+        active = getattr(self.notifier, "conflict_active", False)
+        if active and not self.conflict_warned:
+            self.conflict_warned = True
+            log.error("Telegram 409: instance bot lain terdeteksi, entry baru dihentikan")
+            self.notify("🚨 Instance bot lain terdeteksi (Telegram 409: token yang sama dipakai proses lain, mis. "
+                        "PC lain). Entry baru DIHENTIKAN agar tidak ada order ganda. Posisi tetap dikelola. Matikan "
+                        "salah satu bot; entry pulih otomatis 10 menit setelah konflik berhenti.")
+        elif not active and self.conflict_warned:
+            self.conflict_warned = False
+            self.notify("✅ Konflik instance bot sudah tidak terdeteksi 10 menit, entry baru diizinkan lagi.")
+
+    def feed_block(self, bsym: str) -> str | None:
+        """Tolak entry bila data harga tidak segar: terminal putus, atau tick basi saat pasar seharusnya buka."""
+        st = self.mt5.feed_status(bsym, self.offset)
+        if not st["connected"]:
+            return "feed terputus: terminal MT5 tidak tersambung ke server broker"
+        age = st["tick_age"]
+        if age <= MAX_TICK_AGE_SECONDS:
+            return None
+        if market_closed(st["server_time"], bsym):
+            return f"pasar tutup (tick terakhir {age / 60:.0f} menit lalu)"
+        log.warning("Tick %s basi %.0f detik saat pasar seharusnya buka", bsym, age)
+        return f"tick basi {age:.0f} detik saat pasar seharusnya buka: feed terputus?"
+
+    def refresh_offset(self, now: datetime) -> None:
+        """Deteksi ulang offset jam server tiap jam selama pasar buka (bot yang start saat pasar tutup memakai
+        cadangan GMT+2; broker bisa pindah GMT+2/+3 saat DST). Offset dipakai untuk umur tick, candle, dan expiry
+        limit. Tidak dipakai bila session.server_utc_offset_hours diisi manual."""
+        key = (now.date(), now.hour)
+        if self.s.session.server_utc_offset_hours is not None or self.offset_checked == key or not self.s.symbols:
+            return
+        self.offset_checked = key
+        detected = self.mt5.server_utc_offset(self.s.broker_symbol(self.s.symbols[0].name))
+        if detected is not None and detected != self.offset:
+            log.warning("Offset jam server berubah: GMT%+d -> GMT%+d", self.offset, detected)
+            self.offset = detected
+
     def step(self) -> None:
         self.check_gap(time.time())
         now = datetime.now(timezone.utc)
+        self.refresh_offset(now)
         acc = self.mt5.account()
-        if self.daily.update(now, acc.equity):
-            log.info("Hari baru %s, equity awal %.2f", self.daily.day, acc.equity)
+        self.update_daily(now, acc.equity)
         self.update_drawdown(acc.equity)
+        self.check_conflict()
         if self.last_equity_hour != (now.date(), now.hour):
             self.last_equity_hour = (now.date(), now.hour)
             self.journal.log_equity(acc.balance, acc.equity)
@@ -340,6 +411,11 @@ class LiveBot:
     def entry_block(self, sym: str, bsym: str, direction: int, equity: float, spread_pts: float) -> str | None:
         if self.error_halt:
             return "kill switch aktif (error berulang)"
+        if getattr(self.notifier, "conflict_active", False):
+            return "instance bot lain terdeteksi (Telegram 409): entry dihentikan agar tidak ada order ganda"
+        feed = self.feed_block(bsym)
+        if feed:
+            return feed
         if self.loss_pause():
             return (f"{self.s.risk.stop_after_losses} rugi beruntun: evaluasi dulu, lalu tekan ▶️ Lanjut "
                     f"(atau kirim /lanjut)")
@@ -616,23 +692,25 @@ class LiveBot:
         price = (setup["entry_low"] + setup["entry_high"]) / 2
         sl, tp = setup["stop_loss"], setup["take_profit_1"]
         sl_dist = d * (price - sl)
+        expires = datetime.now(timezone.utc) + timedelta(minutes=setup.get("valid_minutes") or 120)
         try:
             lot = self.lot_for(sym, acc.equity, risk, sl_dist)
             if lot == 0:
                 raise MT5Error(self.min_lot_reason(sym, acc.equity, sl_dist))
-            res = self.mt5.limit_order(bsym, d, lot, price, sl, tp, self.s.magic, "bot user limit")
+            res = self.mt5.limit_order(bsym, d, lot, price, sl, tp, self.s.magic, "bot user limit",
+                                       expires=expires, offset_hours=self.offset)
         except MT5Error as e:
             self.finish_confirmation(row, "failed", f"⚠️ Order limit gagal: {e}")
             return
-        expires = datetime.now(timezone.utc) + timedelta(minutes=setup.get("valid_minutes") or 120)
         self.journal.update_signal(row["id"], user_decision="limit", user_risk=risk, limit_ticket=res.order,
                                    limit_expires=expires.isoformat(timespec="seconds"))
         self.notifier.clear_buttons(row["confirm_msg_id"])
         f = f".{digits}f"
+        when = LIMIT_EXPIRY_TEXT[self.mt5.expiry_mode(bsym)].format(t=f"{expires.astimezone(WIB):%H:%M}")
         self.notify(f"⏳ LIMIT {'BUY' if d == 1 else 'SELL'} {sym} @ {price:{f}} (tengah zona "
                     f"{setup['entry_low']:{f}}-{setup['entry_high']:{f}})\nLot {lot} | SL {sl:{f}} | TP {tp:{f}}\n"
-                    f"Risiko {self.risk_amount(sym, lot, sl_dist):.2f} {acc.currency} | batal otomatis "
-                    f"{expires.astimezone(WIB):%H:%M} WIB, atau jika ada berita / batas rugi tercapai")
+                    f"Risiko {self.risk_amount(sym, lot, sl_dist):.2f} {acc.currency} | {when}; juga dibatalkan bot "
+                    f"jika ada berita / batas rugi tercapai")
 
     def manage_limit_orders(self, now: datetime, equity: float) -> None:
         """Order limit setup: catat saat terisi, batalkan saat kedaluwarsa / kondisi entry tidak lagi aman."""
@@ -723,7 +801,7 @@ class LiveBot:
                  else "🛑 batas rugi harian" if self.daily.halted(acc.equity) else "✅ aktif")
         mode = "DRY-RUN" if self.dry_run else "LIVE (akun DEMO)"
         self.notify(f"📟 Status | {mode}\nEquity {acc.equity:.2f} {acc.currency} | Balance {acc.balance:.2f}\n"
-                    f"P/L hari ini (sejak 07:00 WIB / restart bot): {self.daily.pnl_pct(acc.equity):+.2%}\n"
+                    f"P/L hari ini (sejak 00:00 WIB, termasuk floating): {self.daily.pnl_pct(acc.equity):+.2%}\n"
                     f"Drawdown dari puncak {self.dd.peak:.2f}: {self.dd.drawdown(acc.equity):.1%} "
                     f"(batas {r.max_drawdown_from_peak:.0%})\n"
                     f"Posisi: {len(self.mt5.positions(self.s.magic))}/{r.max_open_positions}\n"
@@ -1680,7 +1758,8 @@ class LiveBot:
             self.notify(f"⚠️ Limit {side} #{ticket} gagal dibatalkan, tidak dipindah. Cek MT5.")
             return
         try:
-            res = self.mt5.limit_order(bsym, d, lot, price, sl, tp, self.s.magic, "bot user limit")
+            res = self.mt5.limit_order(bsym, d, lot, price, sl, tp, self.s.magic, "bot user limit",
+                                       expires=datetime.fromisoformat(row["limit_expires"]), offset_hours=self.offset)
         except MT5Error as e:
             self.journal.update_signal(row["id"], user_decision="limit_cancelled", skip_reason=f"limit: pindah gagal ({e})")
             self.notify(f"⚠️ Limit lama {side} #{ticket} sudah dibatalkan, tetapi limit baru gagal: {e}")
@@ -1692,8 +1771,9 @@ class LiveBot:
                                    tp_distance=d * (tp - price), setup=json.dumps(new_setup, ensure_ascii=False))
         self.notify(f"🔁 LIMIT {side} dipindah (saran AI, disetujui Anda)\n"
                     f"Entry {price:{f}} | SL {sl:{f}} | TP {tp:{f}} | RR {abs(tp - price) / sl_dist:.1f}\n"
-                    f"Lot {lot} | Risiko {self.risk_amount(sym, lot, sl_dist):.2f} {acc.currency} | batal otomatis "
-                    f"{datetime.fromisoformat(row['limit_expires']).astimezone(WIB):%H:%M} WIB")
+                    f"Lot {lot} | Risiko {self.risk_amount(sym, lot, sl_dist):.2f} {acc.currency} | "
+                    + LIMIT_EXPIRY_TEXT[self.mt5.expiry_mode(bsym)].format(
+                        t=f"{datetime.fromisoformat(row['limit_expires']).astimezone(WIB):%H:%M}"))
 
     def sl_problem(self, pos, sym: str, d: int, px: float, new_sl: float | None) -> str | None:
         """Alasan SL baru tidak boleh dipasang: SL hanya boleh mendekat ke harga dan tetap di sisi yang benar."""

@@ -94,15 +94,16 @@ class DrawdownGuard:
 
 @dataclass
 class DailyGuard:
-    """Menghentikan entry baru jika equity turun >= max_daily_loss dari equity awal hari (UTC)."""
+    """Menghentikan entry baru jika equity turun >= max_daily_loss dari equity awal hari. Hari = tanggal `now`
+    yang diberikan (bot live memakai WIB dan menyimpan equity awal hari di jurnal)."""
     max_daily_loss: float
     day: date | None = None
     start_equity: float = 0.0
 
-    def update(self, now_utc: datetime, equity: float) -> bool:
+    def update(self, now: datetime, equity: float) -> bool:
         """Return True jika hari baru dimulai."""
-        if self.day != now_utc.date():
-            self.day, self.start_equity = now_utc.date(), equity
+        if self.day != now.date():
+            self.day, self.start_equity = now.date(), equity
             return True
         return False
 

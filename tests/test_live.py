@@ -1,5 +1,6 @@
 """Alur LiveBot dengan MT5 & LLM palsu: sinyal -> review AI -> order/shadow -> close."""
 import json
+from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,7 +16,7 @@ class FakeMT5:
         self.h1, self.h4, self.meta = h1, h4, meta
         self.open_positions, self.orders, self.closed_positions = [], [], []
         self.closed = {}
-        self.limits, self.pending, self.outcomes = [], [], {}
+        self.limits, self.pending, self.outcomes, self.limit_expiry = [], [], {}, []
         self.sl_moves, self.partials = [], []
 
     def account(self):
@@ -33,6 +34,19 @@ class FakeMT5:
         c = float(self.h1["close"].iloc[-1])
         return SimpleNamespace(bid=c, ask=c + 0.0001)
 
+    feed = {"connected": True, "tick_age": 1.0, "server_time": datetime(2026, 1, 14, 12, 0)}   # Rabu siang
+
+    def feed_status(self, symbol, offset_hours):
+        return dict(self.feed)
+
+    def expiry_mode(self, symbol):
+        return "server"
+
+    detected_offset = None
+
+    def server_utc_offset(self, symbol):
+        return self.detected_offset
+
     def positions(self, magic):
         return list(self.open_positions)
 
@@ -43,8 +57,9 @@ class FakeMT5:
         self.open_positions.append(pos)
         return SimpleNamespace(price=pos.price_open, order=777)
 
-    def limit_order(self, symbol, direction, volume, price, sl, tp, magic, comment):
+    def limit_order(self, symbol, direction, volume, price, sl, tp, magic, comment, expires=None, offset_hours=0):
         self.limits.append((symbol, direction, volume, price, sl, tp))
+        self.limit_expiry.append((expires, offset_hours))
         self.pending.append(SimpleNamespace(ticket=900 + len(self.limits), magic=magic))
         return SimpleNamespace(order=900 + len(self.limits))
 

@@ -31,6 +31,8 @@ sinyal, keputusan AI, trade dan state disimpan di SQLite (`src/bot/journal.py`, 
   # tunggu baris "Bot trading mulai" di data\bot.log
   ```
 - Jangan restart atau ganti branch saat bot berjalan tanpa izin pemilik, karena bot membaca kode dari working tree.
+- **Satu bot per akun.** `run_bot.py` memegang kunci `data/bot.lock`; instance kedua keluar dengan kode 3. Bot di
+  PC lain terdeteksi lewat Telegram 409, dan entry baru diblok. Jangan menonaktifkan pengaman ini.
 - Commit atas nama pemilik saja: **tanpa** trailer `Co-Authored-By: Claude`, tanpa tautan `Claude-Session:`, dan
   tanpa baris "Generated with Claude Code". Commit dan push hanya bila diminta.
 

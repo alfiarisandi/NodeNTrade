@@ -13,6 +13,9 @@ MAX_LEN = 4000  # batas Telegram 4096 karakter per pesan
 MAX_PENDING = 50
 RETRY_SECONDS = 10
 POLL_TIMEOUT = 8   # getUpdates yang macet jangan menahan loop bot terlalu lama
+# HTTP 409 di getUpdates = instance lain memakai token bot yang sama (mis. bot di PC lain pada akun yang sama).
+CONFLICT_RETRY_SECONDS = 60    # saat konflik polling diperlambat: jangan saling rebut update tiap 2 detik
+CONFLICT_HOLD_SECONDS = 600    # tanpa 409 lagi selama ini = instance lain dianggap sudah berhenti
 
 
 class Notifier:
@@ -23,6 +26,12 @@ class Notifier:
         self.pending: list[str] = []
         self.retry_at = 0.0
         self.down = False
+        self.last_error_code: int | None = None
+        self.conflict_at: float | None = None   # waktu (monotonic) 409 terakhir
+
+    @property
+    def conflict_active(self) -> bool:
+        return self.conflict_at is not None and time.monotonic() - self.conflict_at < CONFLICT_HOLD_SECONDS
 
     def _safe(self, err: object) -> str:
         """Pesan error tanpa token bot (URL request memuat token)."""
@@ -30,6 +39,7 @@ class Notifier:
         return text.replace(self.cfg.token, "***") if self.cfg.token else text
 
     def _call(self, method: str, payload: dict, timeout: float = 15, quiet: bool = False) -> dict | None:
+        self.last_error_code = None
         try:
             r = requests.post(f"https://api.telegram.org/bot{self.cfg.token}/{method}", json=payload,
                               timeout=timeout)
@@ -38,6 +48,7 @@ class Notifier:
             (log.debug if quiet else log.warning)("Telegram %s error: %s", method, self._safe(e))
             return None
         if not data.get("ok"):
+            self.last_error_code = data.get("error_code")
             log.warning("Telegram %s gagal: %s", method, self._safe(data)[:200])
             return None
         return data.get("result")
@@ -89,6 +100,10 @@ class Notifier:
         res = self._call("getUpdates", {"offset": self.offset, "timeout": 0,
                                         "allowed_updates": ["callback_query", "message"]},
                          timeout=POLL_TIMEOUT, quiet=self.down)   # gangguan panjang: cukup 1 warning
+        if res is None and self.last_error_code == 409:
+            self.conflict_at = time.monotonic()
+            self.retry_at = time.monotonic() + CONFLICT_RETRY_SECONDS
+            return []
         if res is None:
             self.down = True
             self.retry_at = time.monotonic() + RETRY_SECONDS   # internet putus: jangan coba tiap 2 detik

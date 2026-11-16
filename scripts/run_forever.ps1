@@ -66,6 +66,11 @@ while ($true) {
         Write-Log "Bot berhenti normal (exit 0). run_forever selesai."
         break
     }
+    if ($code -eq 3) {   # bot.instance.EXIT_ALREADY_RUNNING: jangan restart, nanti dua bot di satu akun
+        Write-Log "Bot lain sudah berjalan di mesin ini (exit 3). run_forever berhenti tanpa restart."
+        Send-Telegram "Bot tidak dijalankan: instance lain sudah berjalan di mesin ini (kunci data\bot.lock)."
+        break
+    }
     if (Test-Path $StopFile) { continue }
 
     # Bot yang sempat jalan lama dianggap sehat: jeda restart kembali ke awal
