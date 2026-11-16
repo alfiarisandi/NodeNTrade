@@ -62,6 +62,10 @@ risk:
   risk_per_trade: 0.005     # 0.5% equity per trade, menekan drawdown (batas keras di kode: maks 1%)
   max_daily_loss: 0.015     # berhenti buka posisi baru jika rugi hari ini >= 1.5% (deteksi adaptif 2026-11-16; dulu 2%)
   max_open_positions: 3
+  # Total risiko terbuka maks 1% equity (audit M4, 2026-11-16): rugi bila semua SL kena, posisi bot (Ichimoku + setup AI)
+  # + order limit pending, dibaca langsung dari MT5 (aman saat restart, tanpa hitung ganda). SL di breakeven = 0 risiko.
+  # Entry baru / tombol risiko yang membuat total > 1% ditolak / disembunyikan.
+  max_open_risk: 0.01
   max_currency_exposure: 2  # maks 2 posisi searah pada mata uang yang sama (mis. 2x short USD)
   # Circuit breaker: stop entry baru jika equity turun 15% dari puncak; reset manual (tombol Telegram / --reset-dd).
   # 15% > drawdown terburuk backtest Ichimoku 2019-2026 (13%): terpicu = strategi lebih buruk dari sejarahnya.

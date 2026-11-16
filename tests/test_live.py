@@ -53,14 +53,16 @@ class FakeMT5:
     def market_order(self, symbol, direction, volume, sl_distance, tp_distance, magic, comment):
         self.orders.append((symbol, direction, volume, tp_distance))
         pos = SimpleNamespace(ticket=777, symbol=symbol, type=0 if direction == 1 else 1, time=1, volume=volume,
-                              price_open=self.tick(symbol).ask, sl=0.0, tp=0.0, profit=0.0)
+                              price_open=self.tick(symbol).ask, sl=0.0, tp=0.0, profit=0.0, comment=comment)
         self.open_positions.append(pos)
         return SimpleNamespace(price=pos.price_open, order=777)
 
     def limit_order(self, symbol, direction, volume, price, sl, tp, magic, comment, expires=None, offset_hours=0):
         self.limits.append((symbol, direction, volume, price, sl, tp))
         self.limit_expiry.append((expires, offset_hours))
-        self.pending.append(SimpleNamespace(ticket=900 + len(self.limits), magic=magic))
+        self.pending.append(SimpleNamespace(ticket=900 + len(self.limits), magic=magic, symbol=symbol,
+                                            type=2 if direction == 1 else 3, volume_current=volume,
+                                            price_open=price, sl=sl, comment=comment))
         return SimpleNamespace(order=900 + len(self.limits))
 
     def pending_orders(self, magic):

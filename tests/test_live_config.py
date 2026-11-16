@@ -14,6 +14,10 @@ def test_eurusd_ichimoku_shadow_xauusd_live_h6():
     assert s.symbol_cfg("EURUSD").rule_mode == "shadow" and s.symbol_cfg("XAUUSD").rule_mode == "live"
 
 
+def test_open_risk_cap_one_percent_m4():
+    assert load_settings().risk.max_open_risk == 0.01
+
+
 def test_protected_strategy_and_risk_parameters_unchanged():
     s = load_settings()
     p, r, c = s.strategy, s.risk, s.confirm

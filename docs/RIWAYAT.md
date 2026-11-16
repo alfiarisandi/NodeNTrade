@@ -13,6 +13,25 @@ Catatan apa saja yang dikerjakan di bot ini, terbaru di atas. Rincian teknis ada
   - Posisi EURUSD yang sudah terbuka tetap dikelola (exit sinyal).
   - Setup 📊 Analisis AI di EURUSD tetap berjalan normal, dan Ichimoku XAUUSD tetap live.
   - 📋 Evaluasi menampilkan hasil shadow per pair. `ai_vs_rules` mencatatnya di kelompok `mode_shadow`.
+- **E3, H3 + M4:**
+  - **Blokir per sumber.** Aturan "satu posisi per pair" kini hanya berlaku dalam sumber yang sama: Ichimoku
+    dengan Ichimoku, setup AI dengan setup AI. Sumber posisi dikenali dari komentar order MT5 (`setup` / `limit`)
+    atau jurnal.
+    - Batas jumlah posisi (3) dan eksposur mata uang (2 searah) tetap memakai semua posisi.
+    - Akun Monex-Demo memakai hedging, jadi posisi di pair yang sama tidak saling menutup.
+    - Konsekuensinya, setup AI berlawanan arah dengan posisi Ichimoku di pair yang sama sekarang diizinkan.
+  - **Batas total risiko terbuka 1% equity** (`risk.max_open_risk: 0.01`). Risiko = rugi bila semua SL kena,
+    dibaca langsung dari MT5 (aman saat restart dan mencakup order dari instance lain):
+    - posisi bot dihitung lot × jarak harga open → SL, dan 0 bila SL sudah di breakeven atau mengunci profit;
+    - order pending bot dihitung lot sisa × jarak harga order → SL;
+    - limit yang terisi pindah dari pending ke posisi, sehingga tidak terhitung ganda;
+    - posisi tanpa SL memakai `risk_amount` jurnal; bila tidak ada, entry ditolak.
+  - **Penegakan batas:**
+    - Entry baru ditolak bila opsi risiko terkecilnya sudah melewati batas.
+    - Tombol risiko yang melewati sisa ruang disembunyikan.
+    - Pilihan pemilik dicek ulang saat eksekusi, begitu juga eksekusi otomatis bila konfirmasi dimatikan.
+  - 📟 Status menampilkan risiko terbuka.
+  - Perbaikan tampilan: batas rugi harian 1,5% sebelumnya tertulis "2%" karena format `{:.0%}`.
 - **Jam AI** tetap 15–23 WIB, dievaluasi setelah 2–4 minggu data screener 24/5.
 - **Risiko per trade** tetap (0,5% dasar; Strong 0,5% / Moderate 0,25%).
 - `tests/test_live_config.py` menjaga keputusan ini dan parameter yang dilindungi: Ichimoku H4 SL 2,5 ATR

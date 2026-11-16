@@ -101,6 +101,9 @@ class RiskCfg(BaseModel):
     risk_per_trade: float = Field(0.01, gt=0, le=0.01)
     max_daily_loss: float = Field(0.03, gt=0, le=0.10)
     max_open_positions: int = Field(3, ge=1, le=10)
+    # Total risiko terbuka (rugi bila semua SL posisi + order pending bot kena) maksimal fraksi equity ini; entry baru
+    # yang membuatnya terlampaui ditolak (0 = nonaktif)
+    max_open_risk: float = Field(0.0, ge=0, le=0.05)
     max_currency_exposure: int = Field(2, ge=1)
     max_trades_per_day: int = Field(0, ge=0)   # entry per hari lintas simbol (0 = tanpa batas); baru dipakai backtest
     # Circuit breaker: stop entry baru jika equity turun sejauh ini dari puncaknya (reset manual)

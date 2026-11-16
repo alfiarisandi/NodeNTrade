@@ -365,7 +365,8 @@ class LiveBot:
                         f"Mode shadow: hanya dicatat dan dievaluasi, tidak ada order.")
             return
 
-        block = self.entry_block(sym, bsym, sig.direction, acc.equity, spread_pts)
+        block = self.entry_block(sym, bsym, sig.direction, acc.equity, spread_pts,
+                                 new_risk=min(self.allowed_risk_options()))
         if block:
             self.journal.update_signal(sid, skip_reason=block)
             self.notify(f"⏭️ Sinyal {head} dilewati: {block}")
@@ -395,6 +396,8 @@ class LiveBot:
             skip = self.min_lot_reason(sym, acc.equity, sig.sl_distance)
         elif self.dry_run:
             skip = "dry_run"
+        elif not self.s.confirm.enabled:   # eksekusi otomatis: risiko saran harus muat di batas risiko terbuka
+            skip = self.open_risk_block(acc.equity, suggested)
 
         if skip is None and self.s.confirm.enabled:
             if self.ask_confirmation(sid, sym, sig, head, sl, tp_txt, price_fmt, acc.equity, suggested, lot, ai_text):
@@ -421,7 +424,11 @@ class LiveBot:
                     f"TP {tp_txt}\n{ai_text}")
 
     # ---------- pengecekan & eksekusi (dipakai entry langsung maupun konfirmasi) ----------
-    def entry_block(self, sym: str, bsym: str, direction: int, equity: float, spread_pts: float) -> str | None:
+    def entry_block(self, sym: str, bsym: str, direction: int, equity: float, spread_pts: float,
+                    source: str = "rule", new_risk: float | None = None) -> str | None:
+        """Alasan entry baru tidak boleh dibuka. source = rule (strategi aturan) | ai_setup: aturan satu posisi per
+        pair hanya berlaku dalam sumber yang sama (audit H3). new_risk = risiko entry baru (fraksi equity) untuk batas
+        total risiko terbuka (audit M4); None = tidak dicek di sini."""
         if self.error_halt:
             return "kill switch aktif (error berulang)"
         if getattr(self.notifier, "conflict_active", False):
@@ -435,14 +442,75 @@ class LiveBot:
         if self.journal.get_state("paused") == "1":
             return "entry dijeda (tekan ▶️ Resume atau kirim /resume untuk lanjut)"
         if self.daily.halted(equity):
-            return f"batas rugi harian {self.s.risk.max_daily_loss:.0%} tercapai"
+            return f"batas rugi harian {self.s.risk.max_daily_loss * 100:g}% tercapai"
         if self.dd.halted:
             return (f"circuit breaker aktif: equity turun {self.dd.drawdown(equity):.1%} dari puncak "
                     f"{self.dd.peak:.2f} (batas {self.s.risk.max_drawdown_from_peak:.0%}), reset manual di Telegram")
         if spread_pts > self.s.symbol_cfg(sym).max_spread_points:
             return f"spread {spread_pts:.0f} point terlalu lebar"
-        return check_new_trade(bsym, direction, self.open_list(),
-                               self.s.risk.max_open_positions, self.s.risk.max_currency_exposure)
+        entries = self.open_entries()
+        block = check_new_trade(bsym, direction, [(s, d) for s, d, _ in entries], self.s.risk.max_open_positions,
+                                self.s.risk.max_currency_exposure, [(s, d) for s, d, src in entries if src == source])
+        return block or (self.open_risk_block(equity, new_risk) if new_risk is not None else None)
+
+    # ---------- batas total risiko terbuka (audit M4) ----------
+    def position_source(self, pos) -> str:
+        """ai_setup bila posisi berasal dari setup 📊 (komentar order MT5 'setup' / 'limit', atau tercatat di jurnal),
+        selain itu rule. Komentar ikut tersimpan di MT5, jadi tetap benar setelah restart / dari PC lain."""
+        comment = getattr(pos, "comment", "") or ""
+        return "ai_setup" if "setup" in comment or "limit" in comment or self.setup_of(pos.ticket) else "rule"
+
+    def open_entries(self) -> list[tuple[str, int, str]]:
+        """(simbol broker, arah, sumber) posisi terbuka bot + order limit setup yang menunggu."""
+        return ([(p.symbol, 1 if p.type == 0 else -1, self.position_source(p)) for p in self.mt5.positions(self.s.magic)]
+                + [(self.s.broker_symbol(r["symbol"]), r["direction"], "ai_setup") for r in self.journal.limit_orders()])
+
+    def meta_for(self, bsym: str) -> dict:
+        names = {self.s.broker_symbol(n): n for n in self.meta}
+        return self.meta[names[bsym]] if bsym in names else self.mt5.symbol_meta(bsym)
+
+    def open_risk(self) -> tuple[float, str | None]:
+        """(uang yang hilang bila semua SL kena, masalah | None). Dibaca langsung dari MT5 (sumber kebenaran, aman saat
+        restart, termasuk order dari instance lain dengan magic sama): posisi = lot x jarak harga open -> SL (0 bila SL
+        sudah di breakeven / mengunci profit); order pending = lot sisa x jarak harga order -> SL. Limit yang terisi
+        pindah dari daftar pending ke posisi, jadi tidak terhitung ganda. Posisi tanpa SL memakai risk_amount jurnal;
+        bila tidak ada, risikonya tidak diketahui (masalah)."""
+        total = 0.0
+        for p in self.mt5.positions(self.s.magic):
+            d, m = (1 if p.type == 0 else -1), self.meta_for(p.symbol)
+            if p.sl:
+                total += p.volume * max(0.0, d * (p.price_open - p.sl)) / m["tick_size"] * m["tick_value"]
+                continue
+            row = next((r for r in self.journal.open_trades() if r["ticket"] == p.ticket), None)
+            if row is None or not row["risk_amount"]:
+                return total, f"posisi #{p.ticket} {p.symbol} tanpa SL (risiko tidak diketahui)"
+            total += row["risk_amount"]
+        for o in self.mt5.pending_orders(self.s.magic):
+            d, m = (1 if o.type in (2, 4) else -1), self.meta_for(o.symbol)   # BUY_LIMIT/STOP genap, SELL ganjil
+            if not o.sl:
+                return total, f"order #{o.ticket} {o.symbol} tanpa SL (risiko tidak diketahui)"
+            total += o.volume_current * max(0.0, d * (o.price_open - o.sl)) / m["tick_size"] * m["tick_value"]
+        return total, None
+
+    def risk_room(self, equity: float) -> float | None:
+        """Sisa ruang risiko (fraksi equity) di bawah risk.max_open_risk; None = batas nonaktif."""
+        cap = self.s.risk.max_open_risk
+        if not cap:
+            return None
+        used, problem = self.open_risk()
+        return 0.0 if problem else cap - used / equity
+
+    def open_risk_block(self, equity: float, new_risk: float) -> str | None:
+        cap = self.s.risk.max_open_risk
+        if not cap:
+            return None
+        used, problem = self.open_risk()
+        if problem:
+            return f"batas risiko terbuka: {problem}"
+        if used / equity + new_risk > cap + 1e-9:
+            return (f"batas risiko terbuka {cap * 100:g}%: terpakai {used / equity:.2%} ({used:.2f}), entry baru "
+                    f"{new_risk * 100:g}% akan melewatinya")
+        return None
 
     def news_block(self, bsym: str, setup: bool = False) -> str | None:
         """setup=True: jendela pendek news.setup_block_* untuk setup 📊 Analisis (day trade)."""
@@ -500,8 +568,11 @@ class LiveBot:
         rows = []
         streak = self.tilt_streak()
         seen = set()
+        room = self.risk_room(equity)
         for r in self.allowed_risk_options():
             if max_risk is not None and r > max_risk + 1e-12:   # setup skor di bawah premium: tanpa opsi risiko besar
+                continue
+            if room is not None and r > room + 1e-9:            # melewati batas total risiko terbuka (M4)
                 continue
             opt_lot = self.lot_for(sym, equity, r, sig.sl_distance)
             if opt_lot > 0 and opt_lot not in seen:   # akun kecil: beberapa opsi bisa jadi lot minimum yang sama
@@ -673,7 +744,8 @@ class LiveBot:
 
         # Kondisi bisa berubah selama menunggu jawaban: cek ulang semuanya
         streak = self.tilt_streak()
-        block = (setup_block or self.entry_block(sym, bsym, d, acc.equity, spread_pts)
+        block = (setup_block or self.entry_block(sym, bsym, d, acc.equity, spread_pts,
+                                                 source="ai_setup" if setup else "rule", new_risk=risk)
                  or self.news_block(bsym, setup=bool(setup))
                  or (f"cek tilt: {streak} rugi beruntun, maksimal {self.s.risk.risk_per_trade * 100:g}%"
                      if not any(abs(risk - r) < 1e-9 for r in self.allowed_risk_options()) else None)
@@ -818,7 +890,15 @@ class LiveBot:
                     f"Drawdown dari puncak {self.dd.peak:.2f}: {self.dd.drawdown(acc.equity):.1%} "
                     f"(batas {r.max_drawdown_from_peak:.0%})\n"
                     f"Posisi: {len(self.mt5.positions(self.s.magic))}/{r.max_open_positions}\n"
-                    f"Entry baru: {entry}\nCandle entry berikut: {self.next_entry_close(now)}")
+                    + self.open_risk_text(acc.equity)
+                    + f"Entry baru: {entry}\nCandle entry berikut: {self.next_entry_close(now)}")
+
+    def open_risk_text(self, equity: float) -> str:
+        if not self.s.risk.max_open_risk:
+            return ""
+        used, problem = self.open_risk()
+        return (f"Risiko terbuka (posisi + limit, bila semua SL kena): {used:.2f} = {used / equity:.2%} dari batas "
+                f"{self.s.risk.max_open_risk * 100:g}%" + (f" ⚠️ {problem}" if problem else "") + "\n")
 
     def cmd_positions(self) -> None:
         positions = self.mt5.positions(self.s.magic)
@@ -1046,7 +1126,8 @@ class LiveBot:
         acc = self.mt5.account()
         tick = self.mt5.tick(bsym)
         block = (self.active_setup_block()
-                 or self.entry_block(sym, bsym, st.direction, acc.equity, (tick.ask - tick.bid) / meta["point"])
+                 or self.entry_block(sym, bsym, st.direction, acc.equity, (tick.ask - tick.bid) / meta["point"],
+                                     source="ai_setup", new_risk=min(self.allowed_risk_options()))
                  or self.news_block(bsym, setup=True))
         if block:
             self.notify(f"🚫 Setup tidak ditawarkan ({block}):\n{text}")
@@ -1405,7 +1486,8 @@ class LiveBot:
             return f"kuota {self.s.confirm.max_setups_per_day} setup/hari sudah terpakai"
         bsym, meta = self.s.broker_symbol(sym), self.meta[sym]
         tick = self.mt5.tick(bsym)
-        return (self.entry_block(sym, bsym, direction, self.mt5.account().equity, (tick.ask - tick.bid) / meta["point"])
+        return (self.entry_block(sym, bsym, direction, self.mt5.account().equity, (tick.ask - tick.bid) / meta["point"],
+                                 source="ai_setup", new_risk=min(self.allowed_risk_options()))
                 or self.news_block(bsym, setup=True))
 
     # ---------- screener M15: aturan A-E tanpa AI, AI dipanggil hanya bila ada kandidat ----------
@@ -1654,8 +1736,7 @@ class LiveBot:
     # ---------- posisi ----------
     def open_list(self) -> list[tuple[str, int]]:
         """Posisi terbuka + order limit setup yang menunggu (dihitung untuk batas posisi & eksposur)."""
-        return ([(p.symbol, 1 if p.type == 0 else -1) for p in self.mt5.positions(self.s.magic)]
-                + [(self.s.broker_symbol(r["symbol"]), r["direction"]) for r in self.journal.limit_orders()])
+        return [(s, d) for s, d, _ in self.open_entries()]
 
     def find_ticket(self, bsym: str) -> int | None:
         mine = [p for p in self.mt5.positions(self.s.magic) if p.symbol == bsym]

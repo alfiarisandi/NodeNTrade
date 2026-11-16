@@ -52,12 +52,16 @@ def currency_exposure(positions: list[tuple[str, int]]) -> dict[str, int]:
 
 
 def check_new_trade(symbol: str, direction: int, open_positions: list[tuple[str, int]],
-                    max_open: int, max_exposure: int) -> str | None:
-    """Return alasan penolakan, atau None jika trade boleh dibuka."""
+                    max_open: int, max_exposure: int,
+                    same_source: list[tuple[str, int]] | None = None) -> str | None:
+    """Return alasan penolakan, atau None jika trade boleh dibuka. Batas jumlah posisi dan eksposur memakai semua
+    posisi; aturan satu posisi per pair hanya memakai `same_source` (default: semua), mis. posisi dari sumber
+    yang sama (strategi aturan vs setup AI)."""
     if len(open_positions) >= max_open:
         return f"maks {max_open} posisi terbuka tercapai"
     base, quote = split_currencies(symbol)
-    if any(split_currencies(s) == (base, quote) for s, _ in open_positions):
+    pool = open_positions if same_source is None else same_source
+    if any(split_currencies(s) == (base, quote) for s, _ in pool):
         return f"sudah ada posisi di {symbol}"
     exp = currency_exposure(open_positions + [(symbol, direction)])
     for cur in (base, quote):
