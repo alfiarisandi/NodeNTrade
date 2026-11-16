@@ -19,12 +19,13 @@ from bot.ai.prompts import review_system
 from bot.ai.reviewer import ReviewOutcome, review_signal
 from bot.config import Settings
 from bot.indicators import atr as atr_series
-from bot.intraday import STRATEGIES, all_signals, hybrid, mtf_features
+from bot.intraday import REGIME_STRATEGIES, STRATEGIES, ExitPolicy, IntradayParams, all_signals, mtf_features
 from bot.journal import Journal
 from bot.mt5_client import MT5Client, MT5Error
 from bot.news import Calendar
 from bot.notifier import Notifier
-from bot.opportunities import EV_MIN_TRADES, find_duplicate, format_opportunity_stats, opportunity_stats, simulate
+from bot.opportunities import (EV_MIN_TRADES, find_duplicate, format_opportunity_stats, format_screener_stats,
+                               opportunity_stats, screener_stats, simulate)
 from bot.performance import (current_losing_streak, format_evaluation, format_weekly_fallback, intraday_stats,
                              trade_stats, weekly_stats)
 from bot.risk import DailyGuard, DrawdownGuard, check_new_trade, currency_exposure, lot_with_min
@@ -59,6 +60,8 @@ CLOSE_CONFIRM_SECONDS = 120   # tombol "Ya, tutup" kedaluwarsa: cegah klik tak s
 LIMIT_ADVICE_SECONDS = 900    # tombol saran order limit (pindah / batal) berlaku 15 menit
 SCREEN_MIN_BARS = {"M15": 250, "H1": 210, "H4": 210}   # sama dengan intraday_snapshot
 SCREEN_REPEAT_MINUTES = 60    # kandidat screener pair + arah yang sama tidak dikirim ulang ke AI dalam N menit
+SCREEN_AI_KEYS = ("symbol", "side", "strategy", "regime", "rule_stop_ref")   # isi kandidat yang dikirim ke AI
+SCREEN_ENTRY_MINUTES = 30     # kandidat aturan = entry market di candle berikutnya: harga harus tersentuh dalam 2 candle
 SLEEP_GAP_SECONDS = 600      # jarak antar siklus lebih dari ini = bot sempat tertahan (normal ±20 detik)
 OPPORTUNITY_REVIEW_DAYS = 14  # rentang statistik peluang untuk AI dan 📋 Evaluasi
 MAX_TICK_AGE_SECONDS = 60     # tick lebih tua dari ini saat pasar buka = feed dianggap terputus, entry ditolak
@@ -112,6 +115,7 @@ class LiveBot:
         self.watch_bar: dict[str, pd.Timestamp] = {}   # candle M15 terakhir yang sudah dicek untuk pantauan
         self.screen_bar: dict[str, pd.Timestamp] = {}  # ... dan untuk screener M15
         self.opp_bar: dict[str, pd.Timestamp] = {}     # ... dan untuk penilaian hasil peluang
+        self.screen_logged: dict[str, tuple] = {}      # simbol -> (candle M15, {(strategi, arah): id baris jurnal})
         self.conflict_warned = False                   # peringatan instance lain (Telegram 409) sudah dikirim
         self.offset_checked: tuple | None = None       # (tanggal, jam) UTC terakhir offset server dicek ulang
         self.last_step_wall: float | None = None
@@ -1107,9 +1111,13 @@ class LiveBot:
             return f"EV forward strategi {strategy or '?'} {ev['expectancy_R']:+.2f}R dari {ev['trades']} trade"
         return None
 
-    def opportunity_review(self) -> dict:
+    def review_rows(self) -> list:
         since = datetime.now(timezone.utc) - timedelta(days=OPPORTUNITY_REVIEW_DAYS)
-        return opportunity_stats(self.journal.opportunities_since(since.isoformat(timespec="seconds")))
+        return self.journal.opportunities_since(since.isoformat(timespec="seconds"))
+
+    def opportunity_review(self) -> dict:
+        """Statistik peluang & setup AI (catatan screener terpisah: screener_stats, tidak dikirim ke AI)."""
+        return opportunity_stats([r for r in self.review_rows() if r["kind"] != "screener"])
 
     def cost_r(self, sym: str, risk_dist: float) -> float:
         return self.atr_and_cost(sym)[1] / risk_dist if risk_dist > 0 else 0.0
@@ -1119,8 +1127,10 @@ class LiveBot:
         return getattr(self.llm, "last_model", None) or (self.s.ai.model if self.llm is not None else None)
 
     def recent_opportunities(self) -> list:
+        """Peluang & setup AI 24 jam terakhir (tanpa catatan screener, yang punya deduplikasi sendiri)."""
         since = datetime.now(timezone.utc) - timedelta(days=1)
-        return self.journal.opportunities_since(since.isoformat(timespec="seconds"))
+        return [r for r in self.journal.opportunities_since(since.isoformat(timespec="seconds"))
+                if r["kind"] != "screener"]
 
     def log_idea(self, duplicate_of: int | None = None, **fields) -> None:
         """Catat satu baris peluang. Ide yang sama dengan baris yang masih berlaku (pair + arah + zona tumpang
@@ -1391,27 +1401,45 @@ class LiveBot:
 
     # ---------- screener M15: aturan A-E tanpa AI, AI dipanggil hanya bila ada kandidat ----------
     def screen_candidates(self, sym: str) -> tuple[pd.Series, list[dict]] | None:
-        """Kandidat strategi (sesuai regime) di candle M15 terakhir yang sudah close: (bar, [kandidat]).
-        None bila data kurang."""
+        """Semua kandidat aturan A-E di candle M15 terakhir yang sudah close: (bar, [kandidat]). None bila data
+        kurang. regime_ok = lolos filter regime hybrid (F); hanya itu yang boleh dikirim ke AI. entry / stop /
+        target = level aturan riset (entry ~ close, SL di luar sl_ref + buffer ATR dengan jarak minimum ATR H1 dan
+        biaya, TP 1,5R) untuk dicatat dan disimulasikan."""
         frames = self.analysis_frames(self.s.broker_symbol(sym))
         if any(tf not in frames or len(frames[tf]) < n for tf, n in SCREEN_MIN_BARS.items()):
             return None
         f = mtf_features({tf: frames[tf] for tf in SCREEN_MIN_BARS})
-        cands = hybrid(all_signals(f))
+        cands = all_signals(f)
         last = len(f) - 1
-        digits = self.meta[sym]["digits"]
+        bar, digits = f.iloc[last], self.meta[sym]["digits"]
         rows = cands[cands["i"] == last]
-        return f.iloc[last], [{"symbol": sym, "side": "BUY" if r.dir == 1 else "SELL", "strategy": r.strat,
-                               "regime": r.regime, "rule_stop_ref": round(float(r.sl_ref), digits)}
-                              for r in rows.itertuples()]
+        cost = self.atr_and_cost(sym)[1] if len(rows) else 0.0
+        ip, pol = IntradayParams(), ExitPolicy()
+        out = []
+        for r in rows.itertuples():
+            d, entry = int(r.dir), float(bar["close"])
+            dist = d * (entry - (r.sl_ref - d * ip.sl_buffer_atr * float(bar["atr"])))
+            dist = max(dist, ip.sl_min_atr_h1 * float(bar["h1_atr"]), cost / ip.max_cost_r)
+            ok = math.isfinite(dist) and dist > 0
+            out.append({"symbol": sym, "side": "BUY" if d == 1 else "SELL", "strategy": r.strat, "regime": r.regime,
+                        "rule_stop_ref": round(float(r.sl_ref), digits),
+                        "regime_ok": r.strat in REGIME_STRATEGIES[r.regime],
+                        "entry": round(entry, digits) if ok else None,
+                        "stop": round(entry - d * dist, digits) if ok else None,
+                        "target": round(entry + d * pol.tp_r * dist, digits) if ok else None,
+                        "cost_r": round(cost / dist, 3) if ok else None,
+                        "sl_too_wide": bool(ok and dist > ip.sl_max_atr_h1 * float(bar["h1_atr"]))})
+        return bar, out
 
     def maybe_screener(self, now: datetime) -> None:
-        """Tiap candle M15 close (jam analysis_hours_wib, hari kerja): cari kandidat aturan A-E. Ada kandidat =
-        minta AI menilai (konfirmasi pemilik tetap wajib). Satu analisis per siklus; kandidat pair + arah yang
-        sama tidak dikirim ulang dalam SCREEN_REPEAT_MINUTES."""
-        wib = now.astimezone(WIB)
-        if not (self.s.ai.screener and self.llm is not None and self.watch_hours(wib)):
+        """Tiap candle M15 yang baru close, 24 jam Senin-Jumat: semua kandidat aturan A-E dicatat ke jurnal
+        peluang (kind = screener; tanpa AI, tanpa order) beserta nasibnya. Di jam analysis_hours_wib dengan AI aktif,
+        kandidat yang lolos regime dikirim ke AI seperti sebelumnya (konfirmasi pemilik tetap wajib): satu analisis
+        per siklus, kandidat pair + arah yang sama tidak dikirim ulang dalam SCREEN_REPEAT_MINUTES."""
+        if not self.s.ai.screener:
             return
+        wib = now.astimezone(WIB)
+        ai_on = self.llm is not None and self.watch_hours(wib)
         for sym in self.meta:
             last = self.mt5.rates(self.s.broker_symbol(sym), "M15", 1)
             if last.empty or self.screen_bar.get(sym) == last["time"].iloc[-1]:
@@ -1422,35 +1450,88 @@ class LiveBot:
                 continue
             bar, cands = res
             close_utc = (pd.Timestamp(bar["time"]) + TF_DELTA["M15"] - pd.Timedelta(hours=self.offset)).tz_localize("UTC")
+            kept = [c for c in cands if c.get("regime_ok", True)]
+            fate = {(c["strategy"], c["side"]): ("regime_filtered", f"strategi {c['strategy']} tidak dipakai di regime "
+                                                                    f"{c['regime']}") for c in cands if c not in kept}
+            hours = self.s.ai.analysis_hours_wib
+            if not ai_on:
+                why = (f"di luar jam AI ({min(hours)}:00-{max(hours)}:59 WIB, Senin-Jumat)" if hours and self.llm
+                       else "AI nonaktif / analisis otomatis tidak dijadwalkan")
+                fate.update({(c["strategy"], c["side"]): ("out_of_hours", why) for c in kept})
+                self.log_screener(sym, bar, cands, fate, now)
+                self.screen_bar[sym] = bar["time"]
+                continue
             seen = float(self.journal.get_state("analysis_last_ts") or 0) >= close_utc.timestamp()
-            fresh = [c for c in cands if not seen and now.timestamp() - float(
+            fresh = [c for c in kept if not seen and now.timestamp() - float(
                 self.journal.get_state(f"screen_last:{sym}:{c['side']}") or 0) >= SCREEN_REPEAT_MINUTES * 60]
+            fate.update({(c["strategy"], c["side"]): ("repeat", "candle sudah dianalisis AI" if seen else
+                                                      f"pair + arah sudah dikirim ke AI < {SCREEN_REPEAT_MINUTES} menit")
+                         for c in kept if c not in fresh})
             if not fresh:
+                self.log_screener(sym, bar, cands, fate, now)
                 self.screen_bar[sym] = bar["time"]
                 continue
             c = fresh[0]
             why = self.auto_block(sym, 1 if c["side"] == "BUY" else -1, wib)
             if why:
                 log.info("Kandidat screener %s %s (%s) ditahan: %s", c["side"], sym, c["strategy"], why)
+                fate.update({(o["strategy"], o["side"]): ("held", why) for o in fresh})
+                self.log_screener(sym, bar, cands, fate, now)
                 self.screen_bar[sym] = bar["time"]
                 continue
             if self.analysis_cooldown_left() > 0:
+                fate.update({(o["strategy"], o["side"]): ("cooldown", "analisis AI lain baru jalan (cooldown)")
+                             for o in fresh})
+                self.log_screener(sym, bar, cands, fate, now)
                 return   # analisis lain baru jalan: candle ini dicek ulang siklus berikut
             self.screen_bar[sym] = bar["time"]
+            fate.update({(o["strategy"], o["side"]): ("sent_to_ai", "") for o in fresh})
+            self.log_screener(sym, bar, cands, fate, now)
             digits = self.meta[sym]["digits"]
             bar_wib = close_utc.tz_convert(WIB)
-            others = "".join(f", {o['side']} {o['strategy']}" for o in cands if o is not c)
+            others = "".join(f", {o['side']} {o['strategy']}" for o in kept if o is not c)
             self.notify(f"🔎 Screener M15 {bar_wib:%H:%M} WIB: kandidat {c['side']} {sym} strategi {c['strategy']} "
                         f"{STRATEGIES[c['strategy']]} (regime {c['regime']}{others}). Close "
                         f"{bar['close']:.{digits}f}. Minta AI menilai...")
-            for o in cands:
+            for o in kept:
                 self.journal.set_state(f"screen_last:{sym}:{o['side']}", f"{now.timestamp():.0f}")
-            trigger = {"source": "screener", **c, "other_candidates": [o for o in cands if o is not c],
+            ai_view = lambda o: {k: o[k] for k in SCREEN_AI_KEYS if k in o}   # noqa: E731  isi ke AI tetap sama
+            trigger = {"source": "screener", **ai_view(c), "other_candidates": [ai_view(o) for o in kept if o is not c],
                        "fired": {"m15_close_wib": f"{bar_wib:%H:%M}",
                                  **{k: round(float(bar[k]), digits) for k in ("open", "high", "low", "close")}}}
             self.cmd_analysis(trigger=trigger)
             self.count_trigger(wib)
             return
+
+    def log_screener(self, sym: str, bar: pd.Series, cands: list[dict], fate: dict, now: datetime) -> None:
+        """Catat kandidat screener sekali per candle (kind = screener, tanpa AI). Candle yang sama dicek ulang
+        (setelah cooldown): keputusan baris yang sudah ada diperbarui, tidak dicatat dua kali. Kandidat pair + arah +
+        strategi sama dalam SCREEN_REPEAT_MINUTES ditautkan (duplicate_of) dan tidak disimulasikan ulang."""
+        logged = self.screen_logged.get(sym)
+        if logged and logged[0] == bar["time"]:
+            for key, row_id in logged[1].items():
+                if key in fate:
+                    self.journal.update_opportunity(row_id, decision=fate[key][0], reason=fate[key][1])
+            return
+        ids = {}
+        since = (now - timedelta(minutes=SCREEN_REPEAT_MINUTES)).isoformat(timespec="seconds")
+        recent = [r for r in self.journal.opportunities_since(since) if r["kind"] == "screener" and not r["duplicate_of"]]
+        for c in cands:
+            key = (c["strategy"], c["side"])
+            decision, reason = fate.get(key, ("unknown", ""))
+            if c.get("sl_too_wide"):
+                reason = (reason + "; " if reason else "") + "SL > 2 ATR H1 (aturan riset melewati sinyal ini)"
+            d = 1 if c["side"] == "BUY" else -1
+            dup = next((r["id"] for r in reversed(recent) if r["symbol"] == sym and r["direction"] == d
+                        and r["strategy"] == c["strategy"]), None)
+            entry, stop, target = c.get("entry"), c.get("stop"), c.get("target")
+            rr = abs(target - entry) / abs(entry - stop) if None not in (entry, stop, target) and entry != stop else None
+            ids[key] = self.journal.log_opportunity(
+                symbol=sym, direction=d, kind="screener", strategy=c["strategy"], regime=c.get("regime", ""),
+                decision=decision, reason=reason, entry_low=entry, entry_high=entry, stop=stop, target=target,
+                rr=round(rr, 2) if rr else None, cost_r=c.get("cost_r"), valid_minutes=SCREEN_ENTRY_MINUTES,
+                **({"duplicate_of": dup, "outcome": "duplicate"} if dup else {}))
+        self.screen_logged[sym] = (bar["time"], ids)
 
     def position_action(self, cq: dict) -> None:
         """Tombol per posisi: pc (minta konfirmasi), pcy (tutup), pcn (batal), be (SL ke breakeven)."""
@@ -1917,7 +1998,8 @@ class LiveBot:
             text += "\n\nEV forward per strategi: " + "; ".join(
                 f"{k} {v['trades']} trade {v['expectancy_R']:+.2f}R" + ("" if v["calibrated"] else " (UNCALIBRATED)")
                 for k, v in ev.items())
-        return text + "\n\n" + format_opportunity_stats(self.opportunity_review(), OPPORTUNITY_REVIEW_DAYS)
+        return (text + "\n\n" + format_opportunity_stats(self.opportunity_review(), OPPORTUNITY_REVIEW_DAYS)
+                + "\n\n" + format_screener_stats(screener_stats(self.review_rows()), OPPORTUNITY_REVIEW_DAYS))
 
     def cmd_evaluation(self) -> None:
         self.notify(self.evaluation_text())

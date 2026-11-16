@@ -3,6 +3,30 @@
 Catatan apa saja yang dikerjakan di bot ini, terbaru di atas. Rincian teknis ada di pesan commit
 (`git log`), alasan angka-angka setelan ada di komentar `config/settings.yaml`.
 
+## 2026-11-16: Remediasi audit, Commit C, screener 24/5 catat-saja
+
+Tujuannya mengukur berapa banyak peluang aturan yang sebenarnya tersedia, sebelum jam aktif AI diubah. Jam AI,
+strategi, dan isi yang dikirim ke AI tidak berubah, jadi token tidak bertambah.
+
+- **Pencatatan 24/5 (H8).**
+  - Screener berjalan setiap candle M15 baru, Senin–Jumat 24 jam.
+  - Semua kandidat aturan A–E dicatat ke `opportunities` dengan `kind = screener`, tanpa AI dan tanpa order.
+  - Yang disimpan: waktu WIB (`time_wib`), pair, arah, strategi, regime, entry (≈ close), SL dan TP 1,5R menurut
+    aturan riset, RR, biaya dalam R, dan alasan.
+- **Nasib setiap kandidat:**
+  - di luar jam AI;
+  - ditolak regime (strategi tidak dipakai di regime itu);
+  - pengulangan (pair + arah sudah dikirim ke AI < 60 menit, atau candle sudah dianalisis);
+  - ditahan (pause, rugi harian, berita, kuota, batas analisis pemicu);
+  - cooldown AI (baris yang sama diperbarui bila kemudian terkirim);
+  - dikirim ke AI.
+- **Deduplikasi:** kandidat dengan pair + arah + strategi sama dalam 60 menit ditautkan dan dihitung sekali.
+- **Statistik di 📋 Evaluasi (🛰️ Screener 24/5):** kandidat per pair, strategi, regime, sesi, dan nasib. Juga
+  berapa yang harganya tersentuh, kena TP 1,5R / SL / ambiguous, tidak pernah aktif, dan rata-rata R. Catatan
+  screener tidak masuk statistik peluang AI dan tidak dikirim ke AI.
+- **Replay data nyata 16/11 (00:00–12:30 WIB, tanpa AI):** 10 kandidat unik (6 pengulangan), semuanya SELL di
+  regime TREND, sesi Asia, dan di luar jam AI.
+
 ## 2026-11-16: Remediasi audit, Commit B, integritas pengukuran
 
 Tidak mengubah keputusan trading. Satu perilaku baru yang terlihat: setup yang sama tidak ditawarkan ulang.

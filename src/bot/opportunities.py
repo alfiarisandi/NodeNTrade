@@ -233,6 +233,69 @@ def opportunity_stats(rows) -> dict:
     }
 
 
+SCREEN_FATE_LABEL = {"out_of_hours": "di luar jam AI", "regime_filtered": "ditolak regime", "repeat": "pengulangan",
+                     "held": "ditahan (risiko / berita / kuota)", "cooldown": "cooldown AI", "sent_to_ai": "dikirim ke AI"}
+
+
+def screener_stats(rows) -> dict:
+    """Kandidat screener aturan A-E (catat-saja, tanpa AI): seberapa banyak peluang aturan sebenarnya tersedia,
+    per pair / strategi / regime / sesi, berapa yang harganya tersentuh, kena TP 1,5R atau SL, dan nasibnya di jalur
+    AI. Kandidat yang sama dalam 60 menit dihitung sekali."""
+    from bot.ai.context import session_info   # impor di sini: context membawa banyak dependensi
+
+    rows = [r for r in rows if r["kind"] == "screener"]
+    if not rows:
+        return {"candidates": 0}
+    firsts = [r for r in rows if not _get(r, "duplicate_of")]
+
+    def summary(rs) -> dict:
+        res = [r for r in rs if r["outcome"] in RESOLVED]
+        vals = [float(r["outcome_r"]) for r in res if r["outcome_r"] is not None]
+        return {"n": len(rs), "touched": sum(r["outcome"] in (*RESOLVED, "ambiguous") for r in rs),
+                "tp": sum(r["outcome"] == "win" for r in rs), "sl": sum(r["outcome"] == "loss" for r in rs),
+                "ambiguous": sum(r["outcome"] == "ambiguous" for r in rs),
+                "never_active": sum(r["outcome"] == "not_reached" for r in rs), "open": sum(r["outcome"] == "open" for r in rs),
+                "avg_R": round(sum(vals) / len(vals), 3) if vals else None}
+
+    def group(key) -> dict:
+        out: dict[str, list] = {}
+        for r in firsts:
+            out.setdefault(key(r), []).append(r)
+        return {k: summary(v) for k, v in sorted(out.items())}
+
+    return {
+        "candidates": len(firsts),
+        "repeats": len(rows) - len(firsts),
+        "all": summary(firsts),
+        "by_pair": group(lambda r: r["symbol"]),
+        "by_strategy": group(lambda r: r["strategy"] or "?"),
+        "by_regime": group(lambda r: r["regime"] or "?"),
+        "by_session": group(lambda r: session_info(datetime.fromisoformat(r["created_at"]))["label"]),
+        "by_fate": group(lambda r: r["decision"] or "?"),
+    }
+
+
+def format_screener_stats(st: dict, days: int) -> str:
+    if not st.get("candidates"):
+        return f"🛰️ Screener 24/5 {days} hari terakhir: belum ada kandidat tercatat."
+
+    def line(label: str, groups: dict, names: dict | None = None) -> str:
+        return f"{label}: " + "; ".join(
+            f"{(names or {}).get(k, k)} {v['n']} (TP {v['tp']}/SL {v['sl']}"
+            + (f", {v['avg_R']:+.2f}R" if v["avg_R"] is not None else "") + ")" for k, v in groups.items())
+
+    a = st["all"]
+    repeats = f", {st['repeats']} pengulangan tidak dihitung" if st["repeats"] else ""
+    lines = [f"🛰️ Screener 24/5 (catat-saja, tanpa AI) {days} hari terakhir: {st['candidates']} kandidat{repeats}",
+             f"Harga tersentuh {a['touched']} | TP 1,5R {a['tp']} | SL {a['sl']} | ambiguous {a['ambiguous']} | "
+             f"tidak pernah aktif {a['never_active']} | belum selesai {a['open']}"
+             + (f" | rata-rata {a['avg_R']:+.2f}R" if a["avg_R"] is not None else ""),
+             line("Per pair", st["by_pair"]), line("Per strategi", st["by_strategy"]),
+             line("Per regime", st["by_regime"]), line("Per sesi", st["by_session"]),
+             line("Nasib", st["by_fate"], SCREEN_FATE_LABEL)]
+    return "\n".join(lines)
+
+
 def format_opportunity_stats(st: dict, days: int) -> str:
     if not st.get("detected"):
         return f"🔍 Peluang {days} hari terakhir: belum ada yang tercatat."

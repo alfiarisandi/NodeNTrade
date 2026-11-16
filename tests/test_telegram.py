@@ -490,6 +490,107 @@ def test_screen_candidates_on_real_frames(bot):
         bar, cands = res
         assert "close" in bar and all(c["side"] in ("BUY", "SELL") and c["strategy"] in "ABCDE" for c in cands)
         json.dumps(cands)
+        for c in cands:   # level aturan riset: SL di sisi yang benar, TP 1,5R
+            if c["entry"] is not None:
+                d = 1 if c["side"] == "BUY" else -1
+                risk = d * (c["entry"] - c["stop"])
+                assert risk > 0 and d * (c["target"] - c["entry"]) == pytest.approx(1.5 * risk, abs=2e-5)
+
+
+# ---------- screener 24/5 catat-saja (audit 2026-11-16, Commit C) ----------
+BUY_A = dict(side="BUY", strategy="A", regime="TREND", rule_stop_ref=1.2, regime_ok=True,
+             entry=1.2010, stop=1.1990, target=1.2040, cost_r=0.05)
+
+
+def screener_rows(bot):
+    return [r for r in bot.journal.opportunities_since("2000-01-01") if r["kind"] == "screener"]
+
+
+def test_screener_logs_candidates_outside_ai_hours_without_ai(bot, tsettings):
+    screener_setup(bot, tsettings, [BUY_A, dict(BUY_A, side="SELL", strategy="E", regime_ok=False)])
+    bot.maybe_screener(datetime(2026, 1, 14, 2, 0, tzinfo=timezone.utc))   # 09 WIB: di luar jam AI
+    assert bot.llm.calls == 0                                              # tidak menambah token
+    a, e = screener_rows(bot)
+    assert (a["decision"], a["strategy"], a["direction"], a["regime"]) == ("out_of_hours", "A", 1, "TREND")
+    assert "di luar jam AI (15:00-16:59 WIB" in a["reason"] and a["time_wib"]
+    assert (a["entry_low"], a["stop"], a["target"], a["rr"], a["valid_minutes"]) == (1.2010, 1.1990, 1.2040, 1.5, 30)
+    assert (e["decision"], e["reason"]) == ("regime_filtered", "strategi E tidak dipakai di regime TREND")
+    bot.maybe_screener(datetime(2026, 1, 14, 2, 1, tzinfo=timezone.utc))   # candle sama: tidak dicatat ulang
+    assert len(screener_rows(bot)) == 2
+
+
+def test_screener_in_hours_sends_only_regime_ok_and_same_payload(bot, tsettings):
+    screener_setup(bot, tsettings, [dict(BUY_A, strategy="E", regime_ok=False), BUY_A])
+    bot.maybe_screener(WED_15_WIB)
+    assert bot.llm.calls == 1
+    trig = bot.llm.snaps[-1]["owner_rules"]["triggered_by"]
+    assert trig["strategy"] == "A" and trig["other_candidates"] == []      # E ditolak regime: tidak dikirim
+    assert not {"entry", "stop", "target", "regime_ok", "cost_r"} & set(trig)   # isi ke AI tetap seperti dulu
+    fates = {r["strategy"]: r["decision"] for r in screener_rows(bot)}
+    assert fates == {"E": "regime_filtered", "A": "sent_to_ai"}
+
+
+def test_screener_cooldown_row_updated_not_duplicated(bot, tsettings):
+    screener_setup(bot, tsettings, [BUY_A])
+    bot.analysis_cooldown_left = lambda: 100.0                             # analisis lain baru jalan
+    bot.maybe_screener(WED_15_WIB)
+    assert bot.llm.calls == 0 and [r["decision"] for r in screener_rows(bot)] == ["cooldown"]
+    bot.analysis_cooldown_left = lambda: 0.0                               # cooldown lewat, candle sama
+    bot.maybe_screener(WED_15_WIB)
+    assert bot.llm.calls == 1 and [r["decision"] for r in screener_rows(bot)] == ["sent_to_ai"]
+
+
+def test_screener_repeat_and_held_are_logged_and_linked(bot, tsettings):
+    screener_setup(bot, tsettings, [BUY_A])
+    bot.maybe_screener(WED_15_WIB)                                         # dikirim ke AI
+    bot.journal.set_state("analysis_last_ts", "1")
+    cands = [dict(BUY_A, symbol="EURUSD")]
+    bot.screen_candidates = lambda sym: (bot.mt5.rates(sym, "M15", 1).iloc[-1], cands)
+    m15_bar(bot, 15, bot.mt5.tick("EURUSD").bid)
+    bot.maybe_screener(WED_15_WIB)                                         # candle baru, pair + arah sama < 60 menit
+    first, again = screener_rows(bot)
+    assert (again["decision"], again["duplicate_of"], again["outcome"]) == ("repeat", first["id"], "duplicate")
+    say(bot, "/pause")
+    m15_bar(bot, 30, bot.mt5.tick("EURUSD").bid)
+    cands[:] = [dict(BUY_A, side="SELL", strategy="C", symbol="EURUSD")]
+    bot.maybe_screener(WED_15_WIB)
+    held = screener_rows(bot)[-1]
+    assert held["decision"] == "held" and "dijeda" in held["reason"] and bot.llm.calls == 1
+
+
+def test_screener_stats_by_pair_strategy_regime_session():
+    from bot.opportunities import format_screener_stats, screener_stats
+    base = dict(kind="screener", symbol="EURUSD", strategy="A", regime="TREND", decision="out_of_hours",
+                duplicate_of=None, outcome="win", outcome_r=1.4, created_at="2026-01-14T02:00:00+00:00")
+    rows = [base, dict(base, id=2, outcome="loss", outcome_r=-1.1, symbol="XAUUSD", strategy="C",
+                       created_at="2026-01-14T13:00:00+00:00", decision="sent_to_ai"),
+            dict(base, outcome="not_reached", outcome_r=None, regime="RANGE", strategy="E", decision="regime_filtered"),
+            dict(base, duplicate_of=1, outcome="duplicate", outcome_r=None),
+            dict(base, kind="setup")]                                        # baris AI: tidak ikut
+    st = screener_stats(rows)
+    assert (st["candidates"], st["repeats"]) == (3, 1)
+    assert st["all"]["touched"] == 2 and st["all"]["tp"] == 1 and st["all"]["never_active"] == 1
+    assert st["by_pair"]["EURUSD"]["n"] == 2 and st["by_strategy"]["C"]["sl"] == 1
+    assert set(st["by_regime"]) == {"TREND", "RANGE"} and st["by_fate"]["regime_filtered"]["n"] == 1
+    assert st["by_session"]["Asia"]["n"] == 2                               # 09:00 WIB
+    text = format_screener_stats(st, 14)
+    assert "3 kandidat, 1 pengulangan" in text and "ditolak regime 1" in text and "Per sesi" in text
+    assert screener_stats([dict(base, kind="setup")]) == {"candidates": 0}
+
+
+def test_screener_rows_resolved_and_kept_out_of_ai_review(bot, tsettings):
+    screener_setup(bot, tsettings, [BUY_A])
+    bot.maybe_screener(datetime(2026, 1, 14, 2, 0, tzinfo=timezone.utc))
+    assert bot.opportunity_review() == {"detected": 0}                    # AI tidak melihat catatan screener
+    assert "🛰️ Screener 24/5" in bot.evaluation_text()
+    row = screener_rows(bot)[0]
+    bars = pd.DataFrame({"time": [pd.Timestamp("2026-01-14 08:15") + pd.Timedelta(minutes=15 * i) for i in range(3)],
+                         "open": [1.2010] * 3, "high": [1.2012, 1.2041, 1.2041], "low": [1.2005, 1.2000, 1.2000],
+                         "close": [1.2010, 1.2040, 1.2040]})
+    bot.journal.db.execute("UPDATE opportunities SET created_at='2026-01-14T08:15:00+00:00' WHERE id=?", (row["id"],))
+    bot.mt5.rates = lambda s, tf, n: bars if n != 1 else bars.tail(1)
+    bot.resolve_opportunities()
+    assert (screener_rows(bot)[0]["outcome"], screener_rows(bot)[0]["outcome_r"]) == ("win", 1.45)
 
 
 def test_gap_notice_after_sleep(bot):

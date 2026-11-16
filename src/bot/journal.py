@@ -4,7 +4,7 @@ from __future__ import annotations
 import csv
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA = """
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS opportunities (
     created_at TEXT NOT NULL,
     symbol TEXT NOT NULL,
     direction INTEGER NOT NULL,
-    kind TEXT NOT NULL,              -- setup | opportunity
+    kind TEXT NOT NULL,              -- setup | opportunity (AI) | screener (aturan A-E, catat-saja)
     strategy TEXT,
     regime TEXT,
     score REAL,                      -- 0-10
@@ -119,7 +119,8 @@ class Journal:
                          ("duplicate_of", "INTEGER"),        # ide yang sama dengan baris ini (tidak dihitung ulang)
                          ("target2", "REAL"),
                          ("outcome_tp2", "TEXT"),            # TP1 tercapai lalu: win | loss | timeout | ambiguous
-                         ("outcome_r_tp2", "REAL")]:
+                         ("outcome_r_tp2", "REAL"),
+                         ("time_wib", "TEXT")]:              # waktu tercatat dalam WIB (created_at tetap UTC)
             if col not in have:
                 self.db.execute(f"ALTER TABLE opportunities ADD COLUMN {col} {typ}")
 
@@ -226,11 +227,18 @@ class Journal:
         if isinstance(fields.get("missing"), list):
             fields["missing"] = json.dumps(fields["missing"], ensure_ascii=False)
         fields.setdefault("created_at", _now())
+        fields.setdefault("time_wib", (datetime.fromisoformat(fields["created_at"]) + timedelta(hours=7))
+                          .strftime("%Y-%m-%d %H:%M"))
         cols = ", ".join(fields)
         cur = self.db.execute(f"INSERT INTO opportunities ({cols}) VALUES ({', '.join('?' * len(fields))})",
                               tuple(fields.values()))
         self.db.commit()
         return cur.lastrowid
+
+    def update_opportunity(self, opp_id: int, **fields) -> None:
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE opportunities SET {cols} WHERE id=?", (*fields.values(), opp_id))
+        self.db.commit()
 
     def open_opportunities(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM opportunities WHERE outcome='open' ORDER BY id").fetchall()

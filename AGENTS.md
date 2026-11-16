@@ -72,7 +72,9 @@ Unit test tidak butuh keduanya karena memakai fake (`FakeMT`, `FakeLLM`, `FakeNo
 
 - Teks untuk pengguna (pesan Telegram, log, komentar, docstring, pesan commit) ditulis dalam **bahasa Indonesia**.
   Prompt ke Claude ditulis dalam bahasa Inggris.
-- File repo memakai line ending **CRLF**. Pertahankan CRLF saat mengedit, terutama bila memakai regex atau skrip.
+- Line ending di repo **campuran**: sebagian besar CRLF, sebagian LF (mis. `tests/test_telegram.py`,
+  `src/bot/intraday.py`, skrip `.ps1`). Pertahankan line ending file yang diedit, terutama bila memakai regex atau
+  skrip; cek dengan `git diff --stat` bahwa tidak ada perubahan seluruh file.
 - Ikuti gaya kode sekitarnya: fungsi pendek, komentar seperlunya, tanpa abstraksi tambahan.
 - Waktu:
   - Server MT5 = GMT+2/+3. Tampilan ke pemilik memakai WIB (UTC+7).
