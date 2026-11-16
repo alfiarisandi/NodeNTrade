@@ -18,6 +18,19 @@ def test_open_risk_cap_one_percent_m4():
     assert load_settings().risk.max_open_risk == 0.01
 
 
+def test_ai_scoring_and_prompt_frozen_until_calibration_h9():
+    """H9 opsi B: skor dan prompt analisis AI tidak diubah sampai >= 30 hasil forward valid. Ubah sidik jari ini hanya
+    setelah pemilik menyetujui perubahan skor / prompt berdasarkan data kalibrasi."""
+    import hashlib
+
+    from bot.ai.analysis import MIN_RR, MODERATE_SCORE, SETUP_SCORE_WEIGHTS, STRONG_SCORE
+    from bot.ai.prompts import ANALYSIS_SYSTEM
+    assert SETUP_SCORE_WEIGHTS == {"context": 25, "structure": 20, "liquidity": 15, "price_action": 20,
+                                   "location": 15, "rr": 5}
+    assert (MIN_RR, MODERATE_SCORE, STRONG_SCORE) == (1.3, 60, 80)
+    assert hashlib.sha256(ANALYSIS_SYSTEM.encode()).hexdigest()[:16] == "ce0b3c53e7ce07bb"
+
+
 def test_protected_strategy_and_risk_parameters_unchanged():
     s = load_settings()
     p, r, c = s.strategy, s.risk, s.confirm

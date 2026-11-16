@@ -64,6 +64,52 @@ def test_entries_rejected_or_capped_by_one_percent(tmp_path, risk_settings, at_s
     assert "batas risiko terbuka 1%" in msgs[-1] and len(bot.notifier.buttons) == 1   # penuh: tidak ditawarkan
 
 
+class AnalysisLLM:
+    """Jawaban analisis tetap: satu setup EURUSD + satu peluang WAIT."""
+    last_model = "cc/claude-opus"
+
+    def __init__(self, price):
+        self.price = price
+
+    def complete(self, system, user):
+        import json
+        p = self.price
+        return json.dumps({"text": "analisis", "setups": [
+            {"symbol": "EURUSD", "side": "BUY", "entry_low": p - 0.0005, "entry_high": p + 0.0005, "stop_loss": p - 0.004,
+             "take_profit_1": p + 0.01, "confidence": "High", "strategy": "A", "regime": "TREND",
+             "score": {"context": 22, "structure": 17, "liquidity": 12, "price_action": 17, "location": 13, "rr": 5}}],
+            "opportunities": [{"symbol": "EURUSD", "side": "SELL", "score": 5, "entry_low": p + 0.003,
+                               "entry_high": p + 0.0035, "invalid_level": p + 0.006, "target": p - 0.002}]})
+
+
+def test_calibration_data_collected_h9(tmp_path, risk_settings, at_signal, eurusd_meta):
+    import gzip
+    import json
+    bot, mt5, msgs = make_bot(tmp_path, risk_settings, at_signal, eurusd_meta, None, dry_run=False)
+    bot.llm = AnalysisLLM(mt5.tick("EURUSD").ask)
+    assert bot.cmd_analysis() is True
+    setup_row, opp_row = bot.journal.opportunities_since("2000-01-01")
+    assert setup_row["snapshot_ref"] == opp_row["snapshot_ref"] and setup_row["snapshot_ref"].startswith("snapshots/")
+    assert json.loads(setup_row["score_parts"])["context"] == 22 and setup_row["model"] == "cc/claude-opus"
+    with gzip.open(tmp_path / setup_row["snapshot_ref"], "rt", encoding="utf-8") as fh:
+        snap = json.load(fh)
+    assert snap["model"] == "cc/claude-opus" and "symbols" in snap["context"] and snap["reply"]["setups"][0]["strategy"] == "A"
+    assert bot.snapshot_ref is None                     # catatan berikutnya tidak ikut snapshot lama
+    # eksekusi lalu tutup: R nyata masuk dataset; satu baris per ide
+    click(bot, f"c:{bot.journal.pending_confirmations()[0]['id']}:0.005")
+    ticket = bot.journal.open_trades()[0]["ticket"]
+    bot.journal.close_trade(ticket, 1.2, "2026-01-14T10:00:00+00:00", -45.0)
+    data = bot.journal.ai_dataset()
+    setup = next(r for r in data if r["kind"] == "setup")
+    assert (setup["decision"], setup["user_decision"], setup["executed"], setup["trade_status"]) == \
+        ("offered", "approved", 1, "closed")
+    assert setup["actual_r"] < 0 and len(data) == 2
+    assert "🧮 Data kalibrasi skor AI: 1 trade nyata + 0 hasil simulasi = 1/30 setup" in bot.evaluation_text()
+    paths = bot.journal.export_csv(tmp_path / "export")
+    assert (tmp_path / "export" / "ai_dataset.csv") in paths
+    assert "actual_r" in (tmp_path / "export" / "ai_dataset.csv").read_text(encoding="utf-8").splitlines()[0]
+
+
 def test_rule_and_ai_positions_no_longer_block_each_other_h3(tmp_path, risk_settings, at_signal, eurusd_meta):
     bot, mt5, msgs = make_bot(tmp_path, risk_settings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
     mt5.open_positions.append(pos(1, "BUY", 0.02, 1.1000, 1.0950))              # Ichimoku EURUSD, $10

@@ -32,6 +32,16 @@ Catatan apa saja yang dikerjakan di bot ini, terbaru di atas. Rincian teknis ada
     - Pilihan pemilik dicek ulang saat eksekusi, begitu juga eksekusi otomatis bila konfirmasi dimatikan.
   - 📟 Status menampilkan risiko terbuka.
   - Perbaikan tampilan: batas rugi harian 1,5% sebelumnya tertulis "2%" karena format `{:.0%}`.
+- **E4, H9 opsi B:** skor dan prompt AI tidak diubah sampai ada ≥ 30 hasil forward valid. Selama itu data
+  dikumpulkan:
+  - **Komponen skor** setiap setup (`opportunities.score_parts`), termasuk setup yang ditolak.
+  - **Snapshot per analisis:** konteks yang dikirim ke AI + jawaban yang sudah di-parse + model, disimpan di
+    `data/snapshots/analysis-*.json.gz` (tidak masuk git) dan ditautkan lewat `snapshot_ref`.
+  - **Dataset gabungan** `journal.ai_dataset()` / `run_bot.py --export` → `ai_dataset.csv`: satu baris per ide,
+    berisi skor, model, snapshot, keputusan, nasib di tombol, hasil simulasi M15, dan R trade nyata.
+  - **Penghitung kemajuan** "🧮 Data kalibrasi skor AI: n/30" di 📋 Evaluasi.
+  - `tests/test_live_config.py` mengunci bobot skor, ambang 60/80, RR bersih 1,3, dan sidik jari prompt
+    analisis. Sidik jari baru boleh diubah setelah pemilik menyetujui perubahan.
 - **Jam AI** tetap 15–23 WIB, dievaluasi setelah 2–4 minggu data screener 24/5.
 - **Risiko per trade** tetap (0,5% dasar; Strong 0,5% / Moderate 0,25%).
 - `tests/test_live_config.py` menjaga keputusan ini dan parameter yang dilindungi: Ichimoku H4 SL 2,5 ATR

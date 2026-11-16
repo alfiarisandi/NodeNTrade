@@ -1,6 +1,7 @@
 """Loop utama bot live (akun demo): sinyal -> cek risiko -> review AI -> order -> jurnal & notifikasi."""
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import math
@@ -65,6 +66,7 @@ SCREEN_ENTRY_MINUTES = 30     # kandidat aturan = entry market di candle berikut
 SLEEP_GAP_SECONDS = 600      # jarak antar siklus lebih dari ini = bot sempat tertahan (normal ±20 detik)
 OPPORTUNITY_REVIEW_DAYS = 14  # rentang statistik peluang untuk AI dan 📋 Evaluasi
 MAX_TICK_AGE_SECONDS = 60     # tick lebih tua dari ini saat pasar buka = feed dianggap terputus, entry ditolak
+CALIBRATION_MIN_RESULTS = 30  # hasil forward valid minimum sebelum skor / prompt AI dievaluasi ulang (keputusan H9-B)
 LIMIT_EXPIRY_TEXT = {"server": "batal otomatis di server MT5 {t} WIB (tetap batal walau bot mati)",
                      "day": "⚠️ broker hanya mendukung kedaluwarsa akhir hari: bot membatalkan {t} WIB selama "
                             "berjalan, server membatalkan di akhir hari",
@@ -118,6 +120,8 @@ class LiveBot:
         self.screen_logged: dict[str, tuple] = {}      # simbol -> (candle M15, {(strategi, arah): id baris jurnal})
         self.conflict_warned = False                   # peringatan instance lain (Telegram 409) sudah dikirim
         self.offset_checked: tuple | None = None       # (tanggal, jam) UTC terakhir offset server dicek ulang
+        self.last_ctx: str | None = None               # konteks JSON analisis AI terakhir (untuk snapshot)
+        self.snapshot_ref: str | None = None           # snapshot analisis yang sedang dicatat ke jurnal peluang
         self.last_step_wall: float | None = None
         self.review_prompt = review_system(settings.strategy, settings.risk.risk_per_trade)
 
@@ -999,6 +1003,7 @@ class LiveBot:
         now = datetime.now(timezone.utc).astimezone(WIB)
         used = getattr(self.llm, "last_model", None)
         backup = f" (model cadangan: {used})" if used and used != self.s.ai.model else ""
+        self.snapshot_ref = self.save_snapshot(analysis)
         watched = self.store_watch(analysis)
         opps = [format_opportunity(o, self.meta[o.symbol]["digits"]) for o in analysis.opportunities
                 if o.symbol in self.meta]
@@ -1007,6 +1012,7 @@ class LiveBot:
                     + ("\n\n👀 Dipantau (analisis ulang otomatis saat pemicu kena):\n" + "\n".join(watched)
                        if watched else ""))
         self.offer_setups(analysis)
+        self.snapshot_ref = None
         return True
 
     def analysis_frames(self, bsym: str) -> dict[str, pd.DataFrame]:
@@ -1061,7 +1067,26 @@ class LiveBot:
                                      self.calendar if self.calendar and self.calendar.available else None,
                                      {"equity": round(acc.equity, 2), "balance": round(acc.balance, 2),
                                       "currency": acc.currency}, positions, recent, rules, prices)
+        self.last_ctx = ctx
         return analyze_market(self.llm, ctx)
+
+    def save_snapshot(self, analysis: Analysis) -> str | None:
+        """Simpan konteks yang dikirim ke AI + jawaban yang sudah di-parse + model (data kalibrasi skor, audit H9
+        opsi B) ke snapshots/ di sebelah jurnal. Path relatif dicatat di baris peluang. Gagal simpan tidak
+        menggagalkan analisis."""
+        if self.last_ctx is None:
+            return None
+        name = f"analysis-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.json.gz"
+        try:
+            folder = self.journal.path.parent / "snapshots"
+            folder.mkdir(exist_ok=True)
+            with gzip.open(folder / name, "wt", encoding="utf-8") as fh:
+                json.dump({"model": self.model_used(), "context": json.loads(self.last_ctx),
+                           "reply": analysis.model_dump()}, fh, ensure_ascii=False)
+        except (OSError, ValueError) as e:
+            log.warning("Snapshot analisis gagal disimpan: %s", e)
+            return None
+        return f"snapshots/{name}"
 
     def setup_checks(self, analysis: Analysis) -> list[tuple]:
         """[(setup, alasan_tidak_valid | None, atr_h1)] untuk setup yang pair-nya diperdagangkan bot."""
@@ -1230,7 +1255,7 @@ class LiveBot:
                                           fields.get("entry_low"), fields.get("entry_high"), datetime.now(timezone.utc))
         if duplicate_of:
             fields.update(duplicate_of=duplicate_of, outcome="duplicate")
-        self.journal.log_opportunity(model=self.model_used(), **fields)
+        self.journal.log_opportunity(model=self.model_used(), snapshot_ref=self.snapshot_ref, **fields)
 
     def record_setup(self, st: Setup, decision: str, reason: str | None, sid: int | None) -> None:
         dup = int(reason.split("#")[1].split()[0]) if decision == "duplicate" else None
@@ -1238,7 +1263,7 @@ class LiveBot:
             duplicate_of=dup, symbol=st.symbol, direction=st.direction, kind="setup", strategy=st.strategy,
             regime=st.regime, score=st.score_total / 10, tier=st.grade, decision=decision, reason=reason or "",
             missing=st.missing, activate_if=st.wait_for, entry_low=st.entry_low, entry_high=st.entry_high,
-            stop=st.stop_loss, target=st.take_profit_1, target2=st.take_profit_2, rr=round(st.rr, 2),
+            stop=st.stop_loss, target=st.take_profit_1, target2=st.take_profit_2, rr=round(st.rr, 2), score_parts=st.score,
             cost_r=round(self.cost_r(st.symbol, st.sl_distance), 3), valid_minutes=st.valid_minutes, signal_id=sid)
 
     def record_opportunity(self, o) -> None:
@@ -2095,7 +2120,19 @@ class LiveBot:
                 f"{k} {v['trades']} trade {v['expectancy_R']:+.2f}R" + ("" if v["calibrated"] else " (UNCALIBRATED)")
                 for k, v in ev.items())
         return (text + "\n\n" + format_opportunity_stats(self.opportunity_review(), OPPORTUNITY_REVIEW_DAYS)
-                + "\n\n" + format_screener_stats(screener_stats(self.review_rows()), OPPORTUNITY_REVIEW_DAYS))
+                + "\n\n" + format_screener_stats(screener_stats(self.review_rows()), OPPORTUNITY_REVIEW_DAYS)
+                + "\n\n" + self.calibration_text())
+
+    def calibration_text(self) -> str:
+        """Kemajuan data kalibrasi skor AI (audit H9 opsi B): perubahan skor / prompt ditunda sampai >= 30 hasil
+        forward valid. Valid = setup AI (bukan pengulangan) dengan trade nyata tertutup, atau hasil simulasi M15
+        yang jelas (zona tersentuh lalu TP / SL / timeout)."""
+        rows = [r for r in self.journal.ai_dataset() if r["kind"] == "setup"]
+        actual = sum(r["trade_status"] == "closed" for r in rows)
+        sim = sum(r["trade_status"] != "closed" and r["sim_outcome"] in ("win", "loss", "timeout") for r in rows)
+        return (f"🧮 Data kalibrasi skor AI: {actual} trade nyata + {sim} hasil simulasi = {actual + sim}/"
+                f"{CALIBRATION_MIN_RESULTS} setup. Skor & prompt tidak diubah sebelum {CALIBRATION_MIN_RESULTS} "
+                f"(ekspor: run_bot.py --export -> ai_dataset.csv)")
 
     def cmd_evaluation(self) -> None:
         self.notify(self.evaluation_text())

@@ -95,6 +95,7 @@ def _now() -> str:
 class Journal:
     def __init__(self, path: str | Path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.path = Path(path)
         self.db = sqlite3.connect(str(path))
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
@@ -120,7 +121,9 @@ class Journal:
                          ("target2", "REAL"),
                          ("outcome_tp2", "TEXT"),            # TP1 tercapai lalu: win | loss | timeout | ambiguous
                          ("outcome_r_tp2", "REAL"),
-                         ("time_wib", "TEXT")]:              # waktu tercatat dalam WIB (created_at tetap UTC)
+                         ("time_wib", "TEXT"),               # waktu tercatat dalam WIB (created_at tetap UTC)
+                         ("score_parts", "TEXT"),            # JSON komponen skor setup AI (data kalibrasi, audit H9)
+                         ("snapshot_ref", "TEXT")]:          # file snapshot konteks + jawaban AI (relatif ke jurnal)
             if col not in have:
                 self.db.execute(f"ALTER TABLE opportunities ADD COLUMN {col} {typ}")
 
@@ -224,8 +227,9 @@ class Journal:
 
     # ---------- peluang terdeteksi (tahap deteksi analisis AI) ----------
     def log_opportunity(self, **fields) -> int:
-        if isinstance(fields.get("missing"), list):
-            fields["missing"] = json.dumps(fields["missing"], ensure_ascii=False)
+        for k in ("missing", "score_parts"):
+            if isinstance(fields.get(k), (list, dict)):
+                fields[k] = json.dumps(fields[k], ensure_ascii=False)
         fields.setdefault("created_at", _now())
         fields.setdefault("time_wib", (datetime.fromisoformat(fields["created_at"]) + timedelta(hours=7))
                           .strftime("%Y-%m-%d %H:%M"))
@@ -307,6 +311,21 @@ class Journal:
                                                   "avg_R": round(sum(allr) / len(allr), 3)}
         return summary
 
+    def ai_dataset(self) -> list[sqlite3.Row]:
+        """Data kalibrasi skor AI (audit H9 opsi B): tiap setup / peluang AI (bukan pengulangan) dengan komponen skor,
+        model, snapshot, keputusan, nasib di tombol, hasil simulasi M15 dan R trade nyata bila dieksekusi."""
+        return self.db.execute("""
+            SELECT o.id, o.time_wib, o.symbol, o.direction, o.kind, o.strategy, o.regime, o.score, o.tier,
+                   o.score_parts, o.model, o.snapshot_ref, o.decision, o.reason, o.missing, o.entry_low, o.entry_high,
+                   o.stop, o.target, o.rr, o.cost_r, o.outcome AS sim_outcome, o.outcome_r AS sim_r,
+                   o.outcome_tp2 AS sim_tp2, s.user_decision, COALESCE(s.executed, 0) AS executed,
+                   t.status AS trade_status, t.r_multiple AS actual_r, t.profit AS actual_profit
+            FROM opportunities o
+            LEFT JOIN signals s ON s.id = o.signal_id
+            LEFT JOIN trades t ON t.signal_id = o.signal_id
+            WHERE o.kind IN ('setup', 'opportunity') AND o.duplicate_of IS NULL
+            ORDER BY o.id""").fetchall()
+
     def shadow_mode_signals(self) -> list[sqlite3.Row]:
         """Sinyal strategi aturan di pair mode shadow (symbols[].rule_mode): dicatat + shadow trade, tanpa order."""
         return self.db.execute("SELECT * FROM signals WHERE ai_decision='shadow_mode' ORDER BY id").fetchall()
@@ -323,4 +342,11 @@ class Journal:
                 w.writerow([d[0] for d in cur.description])
                 w.writerows(cur.fetchall())
             paths.append(path)
+        rows = self.ai_dataset()   # data kalibrasi skor AI (audit H9): satu baris per ide, hasil simulasi + nyata
+        path = out_dir / "ai_dataset.csv"
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(rows[0].keys() if rows else ["id"])
+            w.writerows(tuple(r) for r in rows)
+        paths.append(path)
         return paths
