@@ -3,6 +3,35 @@
 Catatan apa saja yang dikerjakan di bot ini, terbaru di atas. Rincian teknis ada di pesan commit
 (`git log`), alasan angka-angka setelan ada di komentar `config/settings.yaml`.
 
+## 2026-11-16: Entry setup 📊 tidak telat lagi (skema A–E)
+
+Pemicu: limit SELL XAUUSD 16/11 dipasang 13:25 WIB padahal zona 3858–3864 sudah tersentuh 13:15–13:20. Analisis
+butuh 131 detik karena Opus dan Sonnet kena 429.
+
+- **A, setup basi:** bila zona sudah tersentuh dalam 6 candle M5 terakhir dan harga sudah > 0,1 ATR H1 menjauh ke
+  arah TP, setup tidak ditawarkan ("⌛ Setup basi"). Setup itu dijadikan pantauan retest zona beserta rencananya.
+  Tidak ada opsi market di harga sekarang.
+- **B, model kena 429:** model yang baru kena rate limit dicoba paling akhir selama 10 menit, tidak dibuang.
+- **C, pemicu zona lewat tick:** pantauan `zone` dicek tiap siklus (SELL = bid, BUY = ask) tanpa menunggu close
+  M15. `close_below` / `close_above` tetap memakai close M15.
+- **D, limit di sisi dekat zona:** SELL di `entry_low`, BUY di `entry_high`. Bila RR bersih di sana < 1,3, limit
+  tetap di tengah zona. Harga limit disimpan di `setup.limit_price`.
+- **E, rencana pra-setuju:** pantauan zona yang punya rencana lengkap (dari peluang yang cocok atau dari setup
+  basi) mendapat tombol "✅ Setujui otomatis" dengan risiko tingkat Moderate. Rencana yang disetujui berlaku 60 menit.
+  Saat zona kena, bot langsung membuka posisi tanpa analisis ulang dan tanpa memakai kuota pemicu. Semua batas keras
+  tetap dicek: RR bersih, zona, kuota setup, satu setup aktif, jeda, berita, spread, dan tilt. Rencana yang sudah
+  disetujui tidak terhapus oleh analisis baru.
+- **Buffer zona 0,15 ATR H1 (`ZONE_BUFFER_ATR`):** SELL XAUUSD zona 3866,93–3870 tidak terisi karena harga balik di
+  3865,22. Limit kini dipasang 0,15 ATR di depan tepi zona (SELL lebih rendah, BUY lebih tinggi). Pemicu tick
+  rencana pra-setuju dan batas "setup basi" memakai buffer yang sama. SL/TP tetap di level setup. Bila RR bersih
+  dengan buffer < 1,3, limit jatuh ke tepi zona, lalu ke tengah zona.
+- **Analisis lambat karena timeout berlapis:** `max_retries` SDK 1 → 0 dan `ai.timeout_seconds` 180 → 120. Opus
+  yang macet tidak lagi diulang SDK (total tunggu bisa ±6 menit sebelum pindah ke Sonnet), tapi langsung ke cadangan.
+- **`ai.max_tokens` 6000 → 12000:** jawaban Opus masih terpotong (15:52 dan 16:05 WIB), lalu pindah ke Sonnet.
+- **Batas setup aktif per pair:** `confirm.max_active_setups` (1) kini dihitung per pair, bukan total. Satu limit
+  XAUUSD tidak lagi memblok setup EURUSD, dan sebaliknya. Batas lain (kuota harian, total risiko terbuka, jeda,
+  berita) tetap global.
+
 ## 2026-11-16: Keputusan pemilik Tahap 5 (Commit E1–E4)
 
 - **E1, H5:** `manage.partial_at_usd` 10 → 0, sehingga parsial $10 mati. Belum diganti dengan parsial berbasis R.

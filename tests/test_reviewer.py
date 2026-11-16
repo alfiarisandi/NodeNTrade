@@ -100,3 +100,29 @@ def test_llm_falls_back_to_next_model(monkeypatch):
     monkeypatch.setattr(llm, "_complete", always_fail)
     with pytest.raises(LLMError, match="semua 3 model gagal"):
         llm.complete("s", "u")
+
+
+def test_llm_tries_rate_limited_models_last(monkeypatch):
+    from bot.ai.client import ClaudeLLM
+    from bot.config import AICfg
+
+    llm = ClaudeLLM(AICfg(base_url="http://x", api_key="k", model="utama", fallback_models=["cadangan1", "cadangan2"]))
+    calls = []
+
+    def fake(model, system, user, max_tokens=None):
+        calls.append(model)
+        if model == "utama":
+            raise LLMError("HTTP 503: [429] rate_limit_error")
+        if model == "cadangan1":
+            raise LLMError("jawaban terpotong (max_tokens)")   # bukan rate limit: tidak ditunda
+        return "ok"
+
+    monkeypatch.setattr(llm, "_complete", fake)
+    llm.complete("s", "u")
+    calls.clear()
+    llm.complete("s", "u")                       # utama baru kena 429: dicoba terakhir
+    assert calls == ["cadangan1", "cadangan2"]
+    llm.rate_limited["utama"] = 0                # masa tunggu lewat: urutan normal lagi
+    calls.clear()
+    llm.complete("s", "u")
+    assert calls == ["utama", "cadangan1", "cadangan2"]

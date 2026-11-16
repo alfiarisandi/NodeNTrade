@@ -1,4 +1,5 @@
 """Konfirmasi manual lewat tombol Telegram sebelum order."""
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -143,8 +144,13 @@ def test_setup_limit_when_zone_not_reached_then_fill_and_expiry(tmp_path, csetti
     row = signal_row(bot)
     assert mt5.orders == [] and len(mt5.limits) == 1 and row["user_decision"] == "limit"
     _, d, vol, price, sl, tp = mt5.limits[0]
-    assert d == 1 and price == pytest.approx(base) and sl == pytest.approx(base - 0.0040) and tp == pytest.approx(base + 0.0100)
-    assert "LIMIT BUY" in msgs[-1] and bot.setups_today() == 0   # limit yang masih menunggu tidak memakai kuota
+    # BUY: entry_high + buffer 0,15 ATR H1 (terjemput walau harga berbalik sebelum zona), SL/TP tetap level setup
+    from bot.live import ZONE_BUFFER_ATR
+    lim = base + 0.0005 + ZONE_BUFFER_ATR * bot.atr_and_cost("EURUSD")[0]
+    assert d == 1 and price == pytest.approx(lim) and sl == pytest.approx(base - 0.0040) and tp == pytest.approx(base + 0.0100)
+    assert "LIMIT BUY" in msgs[-1] and "sisi dekat zona" in msgs[-1] and bot.setups_today() == 0   # limit menunggu tidak memakai kuota
+    assert signal_row(bot)["ref_price"] == pytest.approx(lim)
+    assert bot.limit_item(row, json.loads(signal_row(bot)["setup"]), mt5.pending[0])["limit_price"] == round(lim, 5)
     assert bot.open_list() == [("EURUSD", 1)]   # limit menunggu ikut dihitung untuk batas posisi/eksposur
     # terisi: tercatat sebagai trade
     ticket = row["limit_ticket"]
@@ -159,6 +165,73 @@ def test_setup_limit_when_zone_not_reached_then_fill_and_expiry(tmp_path, csetti
     mt5.pending.append(SimpleNamespace(ticket=ticket, magic=bot.s.magic))
     bot.manage_limit_orders(now, 10_000.0)
     assert mt5.pending == [] and signal_row(bot)["user_decision"] == "limit_cancelled" and "kedaluwarsa" in msgs[-1]
+
+
+def test_stale_setup_not_offered_becomes_retest_and_auto_plan(tmp_path, csettings, at_signal, eurusd_meta):
+    import pandas as pd
+    from types import SimpleNamespace
+    from bot.ai.analysis import Analysis
+    bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
+    bot.s = csettings.model_copy(update={"ai": csettings.ai.model_copy(update={"analysis_hours_wib": [15, 16]})})
+    base = mt5.tick("EURUSD").ask
+    setup = make_setup(base)                                         # BUY zona base +- 0.0005
+    far = base + 0.0030                                              # harga sudah menjauh ke arah TP
+    mt5.tick = lambda symbol: SimpleNamespace(bid=far - 0.0001, ask=far)
+    m5 = pd.DataFrame({"time": [pd.Timestamp("2026-01-14 08:00")], "open": [base], "high": [far],
+                       "low": [base - 0.0001], "close": [far]})       # zona baru tersentuh
+    orig = type(mt5).rates
+    mt5.rates = lambda s, tf, n: m5 if tf == "M5" else orig(mt5, s, tf, n)
+    bot.offer_setups(Analysis(text="x", setups=[setup]))
+    assert signal_row(bot) is None and any("Setup basi" in m for m in msgs)    # tanpa tombol konfirmasi setup
+    [item] = bot.watchlist()
+    assert item["trigger"] == "zone" and item["plan"]["stop_loss"] == pytest.approx(setup.stop_loss)
+    datas = [b[1] for row in bot.notifier.buttons[-1] for b in row]
+    assert datas == [f"wa:{item['id']}:0.0025"]
+
+    click(bot, datas[0])                                              # setujui sekali
+    [item] = bot.watchlist()
+    assert item["auto"]["risk"] == 0.0025 and "disetujui" in msgs[-1]
+    bot.journal.set_state("watchlist", json.dumps([dict(item, created="2026-01-14T07:45:00+00:00")]))
+    now = datetime(2026, 1, 14, 8, 5, tzinfo=timezone.utc)           # Rabu 15:05 WIB
+    bot.maybe_watch_triggers(now)                                     # harga masih jauh dari zona
+    assert mt5.orders == [] and len(bot.watchlist()) == 1
+    mt5.tick = lambda symbol: SimpleNamespace(bid=base - 0.0001, ask=base)   # zona tersentuh (tick)
+    bot.maybe_watch_triggers(now)
+    assert len(mt5.orders) == 1 and bot.watchlist() == [] and "eksekusi otomatis" in " ".join(msgs)
+    row = signal_row(bot)
+    assert row["executed"] == 1 and row["source"] == "ai_setup"
+
+
+def test_limit_entry_buffer_in_front_of_zone(tmp_path, csettings, at_signal, eurusd_meta):
+    from bot.live import ZONE_BUFFER_ATR
+    bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
+    atr = bot.atr_and_cost("EURUSD")[0]
+    p = 1.1
+    sell = dict(entry_low=p, entry_high=p + 0.0005, stop_loss=p + 0.0040, take_profit_1=p - 0.0100)
+    price, near = bot.limit_entry("EURUSD", -1, sell)
+    assert near and price == pytest.approx(p - ZONE_BUFFER_ATR * atr)          # SELL: di bawah tepi zona
+    buy = dict(entry_low=p - 0.0005, entry_high=p, stop_loss=p - 0.0040, take_profit_1=p + 0.0100)
+    assert bot.limit_entry("EURUSD", 1, buy)[0] == pytest.approx(p + ZONE_BUFFER_ATR * atr)   # BUY: di atas tepi zona
+    from bot.ai.analysis import MIN_RR, net_rr
+    cost = bot.atr_and_cost("EURUSD")[1]
+    tp = next(t for t in range(40, 200) if net_rr(t / 1e4, 0.0040, cost) >= MIN_RR) / 1e4   # RR pas di tepi zona
+    assert bot.limit_entry("EURUSD", -1, dict(sell, take_profit_1=p - tp)) == (p, True)  # buffer bikin RR < 1,3
+
+
+def test_auto_plan_blocked_by_hard_limits(tmp_path, csettings, at_signal, eurusd_meta):
+    from types import SimpleNamespace
+    from bot.ai.analysis import Watch
+    bot, mt5, msgs = make_bot(tmp_path, csettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
+    bot.s = csettings.model_copy(update={"ai": csettings.ai.model_copy(update={"analysis_hours_wib": [15, 16]})})
+    base = mt5.tick("EURUSD").ask
+    st = make_setup(base)
+    w = Watch(symbol="EURUSD", side="BUY", trigger="zone", zone_low=st.entry_low, zone_high=st.entry_high, valid_minutes=60)
+    item = bot.watch_item(w, datetime(2026, 1, 14, 7, 0, tzinfo=timezone.utc), 0, bot.plan_dict(st))
+    bot.journal.set_state("watchlist", json.dumps([dict(item, auto={"risk": 0.0025}, expires="2030-01-01T00:00:00+00:00")]))
+    mt5.tick = lambda symbol: SimpleNamespace(bid=base - 0.0001, ask=base)
+    bot.journal.set_state("paused", "1")                              # entry dijeda: batas keras tetap berlaku
+    bot.maybe_watch_triggers(datetime(2026, 1, 14, 8, 5, tzinfo=timezone.utc))
+    assert mt5.orders == [] and mt5.limits == [] and "dijeda" in msgs[-1]
 
 
 def test_setup_outside_zone_executes_when_rr_ok(tmp_path, csettings, at_signal, eurusd_meta):

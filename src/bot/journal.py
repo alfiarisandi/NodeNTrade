@@ -152,12 +152,13 @@ class Journal:
         self.db.commit()
         return cur.lastrowid
 
-    def active_setups(self) -> int:
-        """Posisi terbuka + order limit menunggu yang berasal dari setup 📊 Analisis."""
+    def active_setups(self, symbol: str | None = None) -> int:
+        """Posisi terbuka + order limit menunggu yang berasal dari setup 📊 Analisis (symbol: hanya pair itu)."""
         return self.db.execute(
             "SELECT (SELECT COUNT(*) FROM trades t JOIN signals s ON s.id = t.signal_id"
-            "        WHERE t.status='open' AND s.source='ai_setup')"
-            " + (SELECT COUNT(*) FROM signals WHERE source='ai_setup' AND user_decision='limit')").fetchone()[0]
+            "        WHERE t.status='open' AND s.source='ai_setup' AND (?1 IS NULL OR s.symbol = ?1))"
+            " + (SELECT COUNT(*) FROM signals WHERE source='ai_setup' AND user_decision='limit'"
+            "    AND (?1 IS NULL OR symbol = ?1))", (symbol,)).fetchone()[0]
 
     def setups_executed_since(self, iso_ts: str) -> int:
         """Jumlah setup 📊 Analisis yang benar-benar terisi sejak iso_ts (kuota harian; limit menunggu tidak dihitung)."""

@@ -396,6 +396,34 @@ def test_watch_trigger_reanalyses_once(bot, tsettings):
     assert len(bot.watchlist()) == 1   # analisis baru mengganti pantauan
 
 
+def test_watch_zone_trigger_uses_tick_not_candle_close(bot, tsettings):
+    p = bot.mt5.tick("EURUSD").bid
+    watch_setup(bot, tsettings, [dict(symbol="EURUSD", side="BUY", trigger="zone", zone_low=round(p - 0.0020, 5),
+                                      zone_high=round(p - 0.0010, 5), invalid_level=round(p - 0.0050, 5))])
+    assert len(bot.watchlist()) == 1
+    m15_bar(bot, 0, p)                                # tidak ada candle baru yang menyentuh zona
+    bot.maybe_watch_triggers(WED_15_WIB)
+    assert bot.llm.calls == 1
+    ask = round(p - 0.0015, 5)                        # BUY disentuh oleh ask
+    bot.mt5.tick = lambda s: SimpleNamespace(bid=ask - 0.0001, ask=ask)
+    bot.maybe_watch_triggers(WED_15_WIB)
+    assert bot.llm.calls == 2 and any("tanpa menunggu close M15" in m for m in bot.notifier.msgs)
+    assert bot.llm.snaps[-1]["owner_rules"]["triggered_by"]["fired"]["tick"] == ask
+
+
+def test_store_watch_keeps_approved_plan(bot, tsettings):
+    p = bot.mt5.tick("EURUSD").bid
+    watch_setup(bot, tsettings, [dict(symbol="EURUSD", side="BUY", trigger="zone", zone_low=round(p - 0.0020, 5),
+                                      zone_high=round(p - 0.0010, 5), invalid_level=round(p - 0.0050, 5))])
+    [it] = bot.watchlist()
+    it["auto"], it["expires"] = {"risk": 0.0025}, "2030-01-01T00:00:00+00:00"
+    bot.journal.set_state("watchlist", json.dumps([it]))
+    bot.journal.set_state("analysis_last_ts", "0")
+    say(bot, "📊 Analisis")                            # analisis baru: pantauan biasa diganti, rencana disetujui tetap
+    ids = [i["id"] for i in bot.watchlist()]
+    assert it["id"] in ids and len(ids) == 2
+
+
 def test_watch_invalid_expired_and_outside_hours(bot, tsettings):
     p = bot.mt5.tick("EURUSD").bid
     item = dict(symbol="EURUSD", side="BUY", trigger="close_above", level=round(p + 0.0020, 5),

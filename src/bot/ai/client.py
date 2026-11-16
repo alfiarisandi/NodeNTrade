@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Protocol
 
 import anthropic
@@ -10,6 +11,7 @@ from bot.config import AICfg
 
 
 log = logging.getLogger(__name__)
+RATE_LIMIT_COOLDOWN = 600   # detik: model yang kena 429 dicoba paling akhir selama ini
 
 
 class LLMError(RuntimeError):
@@ -30,23 +32,30 @@ class ClaudeLLM:
             base_url=cfg.base_url,
             api_key=cfg.api_key,
             timeout=cfg.timeout_seconds,
-            max_retries=1,
+            max_retries=0,   # retry = model cadangan; retry SDK pada timeout menggandakan waktu tunggu (16/11: ±6 menit)
         )
 
         self.last_model = cfg.model   # model yang benar-benar menjawab permintaan terakhir
+        self.rate_limited: dict[str, float] = {}   # model -> waktu (monotonic) rate limit berakhir
 
     def complete(self, system: str, user: str) -> str:
         """Coba model utama; jika gagal (limit, kuota, error provider) lanjut ke ai.fallback_models berurutan."""
         models = [self.cfg.model] + [m for m in self.cfg.fallback_models if m and m != self.cfg.model]
+        # Model yang baru kena rate limit dicoba paling akhir (bukan dibuang): hemat waktu tanpa kehilangan cadangan
+        now = time.monotonic()
+        cooled = [m for m in models if self.rate_limited.get(m, 0) > now]
+        order = [m for m in models if m not in cooled] + cooled
         first_error = None
-        for i, model in enumerate(models):
+        for i, model in enumerate(order):
             try:
-                text = self._complete(model, system, user, self.cfg.max_tokens if i == 0 else
+                text = self._complete(model, system, user, self.cfg.max_tokens if model == self.cfg.model else
                                       max(self.cfg.max_tokens, self.cfg.fallback_max_tokens))
             except LLMError as e:
                 first_error = first_error or e
-                if i + 1 < len(models):
-                    log.warning("Model %s gagal (%s), mencoba cadangan %s", model, str(e)[:160], models[i + 1])
+                if "429" in str(e) or "rate_limit" in str(e):
+                    self.rate_limited[model] = time.monotonic() + RATE_LIMIT_COOLDOWN
+                if i + 1 < len(order):
+                    log.warning("Model %s gagal (%s), mencoba cadangan %s", model, str(e)[:160], order[i + 1])
                 continue
             self.last_model = model
             return text

@@ -189,7 +189,7 @@ class ConfirmCfg(BaseModel):
     # Risiko awal setup 📊 per tingkat skor: opsi risk_options terbesar yang tidak melebihinya (di atasnya disembunyikan)
     risk_strong: float = 0.005        # skor 8-10/10
     risk_moderate: float = 0.0025     # skor 6-7/10
-    max_active_setups: int = Field(1, ge=1, le=5)   # posisi + limit setup 📊 yang boleh aktif bersamaan
+    max_active_setups: int = Field(1, ge=1, le=5)   # posisi + limit setup 📊 yang boleh aktif bersamaan, per pair
 
     @field_validator("risk_options")
     @classmethod

@@ -83,8 +83,8 @@ risk:
 ai:
   enabled: true
   on_failure: skip          # skip = lewati sinyal jika AI error | rule_only = tetap trade tanpa AI
-  timeout_seconds: 180
-  max_tokens: 6000          # 4000: jawaban Opus sering terpotong (13/11: 4x pindah ke cadangan); + daftar pantauan
+  timeout_seconds: 120      # Opus normal ±60 dtk; macet = langsung ke cadangan (tanpa retry SDK)
+  max_tokens: 12000         # 4000 lalu 6000 masih sering terpotong (13/11 dan 16/11: pindah ke cadangan); hanya batas atas
   daily_review_hour_utc: 21
   weekly_review_weekday: 4      # laporan mingguan tiap Jumat (UTC) ...
   weekly_review_hour_utc: 21    # ... pukul 21:00 UTC = Sabtu 04:00 WIB
@@ -142,7 +142,7 @@ confirm:
   # strategi dengan EV forward <= 0 setelah 20 trade diblok otomatis.
   risk_strong: 0.005
   risk_moderate: 0.0025
-  max_active_setups: 1          # satu posisi/limit setup 📊 aktif sekaligus (posisi Ichimoku H4 tidak dihitung)
+  max_active_setups: 1          # posisi/limit setup 📊 aktif per pair (posisi Ichimoku H4 tidak dihitung)
 
 # Dynamic stop loss + partial TP, HANYA untuk posisi dari setup 📊 Analisis (posisi Ichimoku tidak disentuh).
 # SL hanya boleh mengetat. R = jarak SL awal. Bisa dimatikan per posisi lewat tombol di 📂 Posisi.

@@ -132,7 +132,7 @@ def test_one_active_setup_at_a_time(tmp_path, osettings, at_signal, eurusd_meta)
     sid = bot.journal.log_signal("EURUSD", 1, "setup lama", 1.1, 0.004, 0.01, {}, source="ai_setup", setup={})
     bot.journal.update_signal(sid, user_decision="limit")   # limit setup sebelumnya masih menunggu
     offer(bot, mt5)
-    assert "sudah ada 1 posisi/limit setup aktif (maks 1)" in msgs[-1] and bot.notifier.buttons == []
+    assert "sudah ada 1 posisi/limit setup EURUSD aktif (maks 1 per pair)" in msgs[-1] and bot.notifier.buttons == []
     assert opps(bot)[0]["decision"] == "blocked"
     bot.journal.update_signal(sid, user_decision="limit_cancelled")
     offer(bot, mt5)
@@ -145,7 +145,16 @@ def test_one_active_setup_at_a_time(tmp_path, osettings, at_signal, eurusd_meta)
     click(bot, f"c:{first}:0.005")
     assert len(mt5.orders) == 1 and bot.journal.active_setups() == 1
     click(bot, f"c:{second}:0.005")
-    assert len(mt5.orders) == 1 and "setup aktif" in msgs[-1]
+    assert len(mt5.orders) == 1 and "setup EURUSD aktif" in msgs[-1]
+
+
+def test_active_setup_limit_is_per_pair(tmp_path, osettings, at_signal, eurusd_meta):
+    bot, mt5, msgs = make_bot(tmp_path, osettings, at_signal, eurusd_meta, FakeLLM(), dry_run=False)
+    sid = bot.journal.log_signal("XAUUSD", -1, "setup emas", 3861, 12, 22, {}, source="ai_setup", setup={})
+    bot.journal.update_signal(sid, user_decision="limit")   # limit XAUUSD menunggu: tidak memblok EURUSD
+    assert bot.journal.active_setups() == 1 and bot.journal.active_setups("EURUSD") == 0
+    offer(bot, mt5)
+    assert bot.notifier.buttons and opps(bot)[-1]["decision"] == "offered"
 
 
 def test_negative_forward_ev_blocks_strategy(tmp_path, osettings, at_signal, eurusd_meta):
