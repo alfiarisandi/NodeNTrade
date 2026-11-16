@@ -148,8 +148,10 @@ manage:
   partial_frac: 0.5     # tutup 50% lot di target parsial (butuh lot >= 2x lot minimum; kalau tidak, TP1 menutup semua)
   partial_at_r: 1.0     # target parsial = +1R (0 = di TP1). Backtest xs: parsial di 1R menaikkan win rate ~36% -> ~48-51%
                         # dengan profit factor hampir sama; parsial di 0.5R / TP dekat menaikkan win rate tapi merugi
-  partial_at_usd: 10    # ... atau saat profit floating posisi >= $10, mana yang lebih dulu (0 = nonaktif). Skema pemilik
-                        # 2026-11-13: kunci separuh di $10, sisa jalan ke TP1/TP2 dengan SL breakeven. Belum di-backtest.
+  partial_at_usd: 0     # ... atau saat profit floating posisi >= $N, mana yang lebih dulu (0 = nonaktif).
+                        # DIMATIKAN 2026-11-16 (audit H5): $10 = +0.4R / +0.2R pada risiko $25 / $50 lalu SL breakeven,
+                        # belum di-backtest; riset: parsial <= 0.5R menaikkan win rate tapi merugi; 12/11 penutupan dini
+                        # membuang -3.6R. Evaluasi ulang setelah ada backtest kebijakan manajemen posisi setup.
   trail: atr            # sisa posisi setelah TP1: atr | swing | none
   trail_tf: M15
   trail_atr_mult: 1.5

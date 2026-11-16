@@ -3,6 +3,16 @@
 Catatan apa saja yang dikerjakan di bot ini, terbaru di atas. Rincian teknis ada di pesan commit
 (`git log`), alasan angka-angka setelan ada di komentar `config/settings.yaml`.
 
+## 2026-11-16: Keputusan pemilik Tahap 5 (Commit E1–E4)
+
+- **E1, H5:** `manage.partial_at_usd` 10 → 0, sehingga parsial $10 mati. Belum diganti dengan parsial berbasis R.
+  Akan dievaluasi ulang setelah ada backtest kebijakan manajemen posisi setup. Parsial di +1R / TP1, breakeven
+  1R, dan kunci 0,5R di 1,5R tetap seperti sebelumnya.
+- **Jam AI** tetap 15–23 WIB, dievaluasi setelah 2–4 minggu data screener 24/5.
+- **Risiko per trade** tetap (0,5% dasar; Strong 0,5% / Moderate 0,25%).
+- `tests/test_live_config.py` menjaga keputusan ini dan parameter yang dilindungi: Ichimoku H4 SL 2,5 ATR
+  (exit sinyal, filter MA200), rugi harian 1,5%, dan risiko per trade.
+
 ## 2026-11-16: Remediasi audit, Commit D, backtest lebih realistis
 
 Parameter strategi tidak diubah; variasi parameter hanya dilaporkan. Bot live tidak terpengaruh, karena perubahan
